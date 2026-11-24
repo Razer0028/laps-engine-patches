@@ -1,0 +1,296 @@
+diff --git a/src/kernels/cuda/iq_kernels.cu b/src/kernels/cuda/iq_kernels.cu
+index 8262f5662..6f7be2da2 100644
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -691,10 +691,27 @@ __device__ __forceinline__ void tq_states4(const uint8_t* qs, int l, uint32_t s[
+ struct TqLane { int q[4]; float d; };
+ // STAGED: the int8 codebook is read from shared memory (s_lut: the 2048 u16 of tq_lut_i8, copied by stage_iq_grid)
+ // instead of the global table.  The same 16-bit entries, so the same weights.
+-template<int TY, bool STAGED = false>
++template<int TY, bool STAGED = false, bool ROW4 = false>
+ __device__ __forceinline__ TqLane tq_load(const void* __restrict__ vbq, int kbx, int iqs, const uint16_t* __restrict__ s_lut = nullptr) {
+     const auto* b = (const typename TqInfo<TY>::block_t*) vbq + kbx;
+     uint32_t s[4];
++    if constexpr (TY == 144 && STAGED && ROW4) {
++        // 前の塊の最後のバイト（qs[31]）は、隣のレーン（t-1・t=0 は 7）の b3 ＝ 8 レーンのグループ内のシャッフルで取る（global の 1 バイト読みをやめる）。
++        // 8 レーンのグループは必ず全員で呼ぶこと（gu は 2*n_ff=1280 行＝32 の倍数、down は 2560 行＝32 の倍数で、早期 return する行が無い）。
++        const int l = iqs / 4;
++        const uint16_t* qs16 = (const uint16_t*) b->qs;
++        uint32_t w01, w23;
++        if (ROW4 && (kbx & 1)) {
++            // 行の先頭が 4 バイト境界（gu の行は 680 B）なら、奇数番の塊の qs は 4 バイト境界（34k+2 = 0 mod 4）＝ 2 回の 16 ビット読みを 1 回の 32 ビット読みに
++            const uint32_t w = __ldg((const unsigned int*) (b->qs + 4 * l));
++            w01 = w & 0xFFFFu; w23 = w >> 16;
++        } else {
++            w01 = STRATA_TQ_LD16(qs16 + 2 * l + 0); w23 = STRATA_TQ_LD16(qs16 + 2 * l + 1);
++        }
++        const uint32_t b0 = w01 & 0xFF, b1 = w01 >> 8, b2 = w23 & 0xFF, b3 = w23 >> 8;
++        const uint32_t prev = (uint32_t) __shfl_sync(0xffffffffu, (int) b3, (l + 7) & 7, 8);
++        s[0] = (prev << 8) | b0; s[1] = (b0 << 8) | b1; s[2] = (b1 << 8) | b2; s[3] = (b2 << 8) | b3;
++    } else
+     tq_states4<TY>(b->qs, iqs / 4, s);
+     TqLane r;
+     const uint16_t* lut = STAGED ? s_lut : tq_lut_i8;
+@@ -1458,9 +1475,9 @@ template<> inline constexpr bool kSplit<145> = true;
+ template<> inline constexpr bool kSplit<146> = true;
+ template<int TY> struct SplitTq {
+     using W = TqLane;
+-    template<bool STAGE_GRID = false>   // STAGE_GRID: the codebook in shared memory (s_grid, see stage_iq_grid)
++    template<bool STAGE_GRID = false, bool ROW4 = false>   // STAGE_GRID: the codebook in shared memory (s_grid, see stage_iq_grid)
+     __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ s_grid = nullptr) {
+-        return tq_load<TY, STAGE_GRID>(vbq, kbx, iqs, (const uint16_t*) s_grid);
++        return tq_load<TY, STAGE_GRID, ROW4>(vbq, kbx, iqs, (const uint16_t*) s_grid);
+     }
+     __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) { return tq_apply(r, bq8_1, iqs); }
+ };
+@@ -1706,7 +1723,7 @@ __device__ __forceinline__ void row_dot_160_sub8(const uint8_t* row, const block
+ #pragma unroll
+         for (int v = 0; v < 4; ++v) {
+             const int kbx = v + 4 * j, iqs = F::step * t;
+-            const typename S::W w = S::template load<STAGE_GRID>(row, kbx, iqs, s_grid);
++            const typename S::W w = S::template load<STAGE_GRID, true>(row, kbx, iqs, s_grid);   // gu の行は 4 バイト境界
+ #pragma unroll
+             for (int c = 0; c < NC; ++c)
+                 if (EXACT_N || c < n) p[v][c] += S::apply(w, x + off[c] + kbx * (F::qk / 32), iqs);
+@@ -4192,6 +4209,132 @@ bool expdec_down(const NativeExpertLayout& L, int64_t gy, int64_t cap_groups, cu
+     return true;
+ }
+ 
++
++// ---- W4 v1: gate/up の TQ 行（sub8）。活性（q8_1）を共有メモリへ 1 回だけ置き、qs は int4 並べ・ds は float 別配列にして、
++// 1 レーン・1 ステップの読みを LDG 5 回 → LDS.128 + LDS.32 にする。足し算の順・式は row_dot_160_sub8 と同じ。
++template<int TG>
++__device__ __forceinline__ TqLane tq_load_d(const uint8_t* __restrict__ row, int kbx, int t, const uint16_t* __restrict__ s_lut, bool wide) {
++    const auto* b = (const typename TqInfo<TG>::block_t*) row + kbx;
++    const uint16_t* qs16 = (const uint16_t*) b->qs;
++    uint32_t w01, w23;
++    if (wide) {
++        const uint32_t w = __ldg((const unsigned int*) (b->qs + 4 * t));
++        w01 = w & 0xFFFFu; w23 = w >> 16;
++    } else {
++        w01 = STRATA_TQ_LD16(qs16 + 2 * t + 0); w23 = STRATA_TQ_LD16(qs16 + 2 * t + 1);
++    }
++    const uint32_t b0 = w01 & 0xFF, b1 = w01 >> 8, b2 = w23 & 0xFF, b3 = w23 >> 8;
++    const uint32_t prev = (uint32_t) __shfl_sync(0xffffffffu, (int) b3, (t + 7) & 7, 8);
++    uint32_t st[4];
++    st[0] = (prev << 8) | b0; st[1] = (b0 << 8) | b1; st[2] = (b1 << 8) | b2; st[3] = (b2 << 8) | b3;
++    TqLane r;
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        const uint32_t x = (st[i] & TQ_STATE_MASK) * 0x9e3779b1u;
++        r.q[i] = (int) ((uint32_t) s_lut[x >> 21] | ((uint32_t) s_lut[(x >> 10) & 2047u] << 16));
++    }
++    r.d = tq_h2f(STRATA_TQ_LD16(&b->d));
++    return r;
++}
++template<int TG>
++__device__ __forceinline__ TqLane tq_load_f(const uint8_t* __restrict__ row, int kbx, int t, const uint16_t* __restrict__ s_lut, bool wide) {
++    const auto* b = (const typename TqInfo<TG>::block_t*) row + kbx;
++    const uint16_t* qs16 = (const uint16_t*) b->qs;
++    uint32_t w;
++    if (wide) w = __ldg((const unsigned int*) (b->qs + 4 * t));
++    else w = STRATA_TQ_LD16(qs16 + 2 * t + 0) | (STRATA_TQ_LD16(qs16 + 2 * t + 1) << 16);
++    const uint32_t prev = (uint32_t) __shfl_sync(0xffffffffu, (int) (w >> 24), (t + 7) & 7, 8);
++    uint32_t st[4];
++    st[0] = __byte_perm(w, prev, 0x5540); st[1] = __byte_perm(w, 0u, 0x4401); st[2] = __byte_perm(w, 0u, 0x4412); st[3] = __byte_perm(w, 0u, 0x4423);
++    TqLane r;
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++        const uint32_t x = (st[i] & TQ_STATE_MASK) * 0x9e3779b1u;
++        r.q[i] = (int) ((uint32_t) s_lut[x >> 21] | ((uint32_t) s_lut[(x >> 10) & 2047u] << 16));
++    }
++    r.d = tq_h2f(STRATA_TQ_LD16(&b->d));
++    return r;
++}
++template<int TG, int NC>
++__device__ __forceinline__ void gu_tq_pass(const uint8_t* __restrict__ wr, const uint16_t* __restrict__ s_lut, const int4* __restrict__ s_qs,
++                                           const float* __restrict__ s_ds, int t, float (&s)[NC]) {
++    float p[4][NC];
++#pragma unroll
++    for (int v = 0; v < 4; ++v)
++#pragma unroll
++        for (int c = 0; c < NC; ++c) p[v][c] = 0.0f;
++#pragma unroll
++    for (int j = 0; j < 5; ++j) {
++#pragma unroll
++        for (int v = 0; v < 4; ++v) {
++            const int kbx = v + 4 * j;
++            const TqLane w = tq_load_f<TG>(wr, kbx, t, s_lut, (kbx & 1) != 0);
++            const int blk = kbx * 4 + (t >> 1);
++#pragma unroll
++            for (int c = 0; c < NC; ++c) {
++                const int4 qv = s_qs[(c * 80 + blk) * 2 + (t & 1)];
++                int sumi = 0;
++                sumi = ggml_cuda_dp4a(w.q[0], qv.x, sumi);
++                sumi = ggml_cuda_dp4a(w.q[1], qv.y, sumi);
++                sumi = ggml_cuda_dp4a(w.q[2], qv.z, sumi);
++                sumi = ggml_cuda_dp4a(w.q[3], qv.w, sumi);
++                p[v][c] += w.d * s_ds[c * 80 + blk] * (float) sumi;
++            }
++        }
++    }
++#pragma unroll
++    for (int c = 0; c < NC; ++c) {
++        s[c] = __fadd_rn(__fadd_rn(p[0][c], p[2][c]), __fadd_rn(p[1][c], p[3][c]));
++#pragma unroll
++        for (int o = 4; o > 0; o >>= 1) s[c] += __shfl_xor_sync(0xffffffffu, s[c], o);
++    }
++}
++template<int TG>
++__global__ void __launch_bounds__(256, 4) native_gu_tq_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
++                                                           const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_tok,
++                                                           const block_q8_1* __restrict__ xq, NativeExpertLayout L,
++                                                           float* __restrict__ gate, float* __restrict__ up) {
++    const int ng = *n_groups;
++    if (blockIdx.y >= ng) return;
++    STRATA_SHARED_ALIGN16_U32(s_lut_buf, 1024);
++    __shared__ __align__(16) int4 s_qs[GRP_NC * 80 * 2];
++    __shared__ float s_ds[GRP_NC * 80];
++    const uint16_t* s_lut = (const uint16_t*) stage_iq_grid<TG, true>(s_lut_buf, threadIdx.x, 256);
++    const int subwarp = threadIdx.x >> 3, t = threadIdx.x & 7;
++    const int row = blockIdx.x * 32 + subwarp;
++    const bool valid = row < 2 * L.n_ff;                      // gu は 1280 行＝32 の倍数で常に真。shfl を全員で呼ぶため早期 return はしない
++    const bool is_up = row >= L.n_ff;
++    const int r = is_up ? row - (int) L.n_ff : row;
++    const size_t w_off = (is_up ? L.up_off : 0) + (size_t) (valid ? r : 0) * L.gu_row;
++    float* dst = is_up ? up : gate;
++    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
++        const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
++        const float sc = L.tail_off ? ((const float*) (grp_ptr[g] + L.tail_off))[is_up ? 1 : 0] : 1.0f;
++        const int e0 = grp_start[g], e1 = grp_start[g + 1];
++        for (int e = e0; e < e1; e += GRP_NC) {
++            const int n = min(GRP_NC, e1 - e);
++            __syncthreads();
++            for (int u = threadIdx.x; u < n * 80; u += 256) {
++                const int i = u / 80, b = u - i * 80;
++                const uint32_t* src = reinterpret_cast<const uint32_t*>(xq + (size_t) ent_tok[e + i] * 80 + b);
++                const uint32_t dsw = src[0];
++                
++                s_ds[u] = __low2float(*reinterpret_cast<const __half2*>(&dsw)) * TQ_LUT_I8_SCALE;
++                int4 a, bq;
++                a.x = (int) src[1]; a.y = (int) src[2]; a.z = (int) src[3]; a.w = (int) src[4];
++                bq.x = (int) src[5]; bq.y = (int) src[6]; bq.z = (int) src[7]; bq.w = (int) src[8];
++                s_qs[u * 2] = a; s_qs[u * 2 + 1] = bq;
++            }
++            __syncthreads();
++            for (int i0 = 0; i0 < n; i0 += 2) {   // 3〜4 個のときは 2 個ずつ重みを復号し直す（各エントリの和は互いに独立＝ビット一致）
++                const int m = min(2, n - i0);
++                const int4* qb = s_qs + i0 * 160; const float* db = s_ds + i0 * 80;
++                if (m == 1) { float s1[1]; gu_tq_pass<TG, 1>(wr, s_lut, qb, db, t, s1); if (valid && t == 0) dst[(size_t) (e + i0) * L.n_ff + r] = s1[0] * sc; }
++                else { float s2[2]; gu_tq_pass<TG, 2>(wr, s_lut, qb, db, t, s2); if (valid && t < 2) dst[(size_t) (e + i0 + t) * L.n_ff + r] = s2[t] * sc; }
++            }
++        }
++    }
++}
+ template<int TG>
+ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                const int32_t* n_groups, const int32_t* ent_tok, const block_q8_1* X, const NativeExpertLayout& L,
+@@ -4206,6 +4349,8 @@ void launch_gu(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, con
+             if (tq_sub8_on() && (L.n_embd / Fmt<TG>::qk) * Fmt<TG>::ipb == 160) {
+                 dim3 g8 = grid;
+                 g8.x = (unsigned) ((2 * L.n_ff + 31) / 32);
++                native_gu_tq_kernel<TG><<<g8, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
++                return;
+                 native_gu_multi_kernel<TG, true, true><<<g8, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
+                 return;
+             }
+@@ -4273,6 +4418,88 @@ bool launch_gu_swiglu(const NativeExpertLayout& L, int64_t gy, cudaStream_t s, c
+     }
+ }
+ 
++
++// ---- W4 v1: down の TQ 行（K=40・8 レーン/行）。活性 hq を共有メモリの int4 並べにし、重みは「前の塊の最後のバイト」をシャッフルで・
++// 4 バイト境界の塊は 32 ビット 1 回読みで取る。warp 内の 4 行の番号の偶奇をそろえる（行 r の qs の境界は (r + 塊番号) が奇数のとき 4 バイト境界）。
++template<int TG, int NC>
++__device__ __forceinline__ float dn_tq_term(const TqLane& w, const int4* __restrict__ s_qs, const float* __restrict__ s_ds, int c, int blk, int t) {
++    const int4 qv = s_qs[(c * 20 + blk) * 2 + (t & 1)];
++    int sumi = 0;
++    sumi = ggml_cuda_dp4a(w.q[0], qv.x, sumi);
++    sumi = ggml_cuda_dp4a(w.q[1], qv.y, sumi);
++    sumi = ggml_cuda_dp4a(w.q[2], qv.z, sumi);
++    sumi = ggml_cuda_dp4a(w.q[3], qv.w, sumi);
++    return w.d * (s_ds[c * 20 + blk] * TQ_LUT_I8_SCALE) * (float) sumi;
++}
++template<int TG, int NC>
++__device__ __forceinline__ void dn_tq_pass(const uint8_t* __restrict__ wr, int rpar, const uint16_t* __restrict__ s_lut, const int4* __restrict__ s_qs,
++                                           const float* __restrict__ s_ds, int t, float (&s)[NC]) {
++    // k = t + 8*kb: 塊 kb、レーン t。hq の塊は kb*4 + t/2 でなく、row_dot_40_sub8 の x + kbx*(qk/32) + l/2 ＝ kb*4 + t/2（qk=128 → 4 つの q8_1）
++    const int hb = t >> 1;
++    TqLane w0 = tq_load_d<TG>(wr, 0, t, s_lut, ((0 + rpar) & 1) != 0);
++    TqLane w4 = tq_load_d<TG>(wr, 4, t, s_lut, ((4 + rpar) & 1) != 0);
++    TqLane w2 = tq_load_d<TG>(wr, 2, t, s_lut, ((2 + rpar) & 1) != 0);
++    TqLane w1 = tq_load_d<TG>(wr, 1, t, s_lut, ((1 + rpar) & 1) != 0);
++    TqLane w3 = tq_load_d<TG>(wr, 3, t, s_lut, ((3 + rpar) & 1) != 0);
++#pragma unroll
++    for (int c = 0; c < NC; ++c) {
++        float a = 0.0f;
++        a += dn_tq_term<TG, NC>(w0, s_qs, s_ds, c, 0 * 4 + hb, t);
++        a += dn_tq_term<TG, NC>(w4, s_qs, s_ds, c, 4 * 4 + hb, t);
++        float s16 = 0.0f;
++        s16 += dn_tq_term<TG, NC>(w2, s_qs, s_ds, c, 2 * 4 + hb, t);
++        a = __fadd_rn(a, s16);
++        float s8 = 0.0f;
++        s8 += dn_tq_term<TG, NC>(w1, s_qs, s_ds, c, 1 * 4 + hb, t);
++        float s24 = 0.0f;
++        s24 += dn_tq_term<TG, NC>(w3, s_qs, s_ds, c, 3 * 4 + hb, t);
++        a = __fadd_rn(a, __fadd_rn(s8, s24));
++#pragma unroll
++        for (int o = 4; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
++        s[c] = a;
++    }
++}
++template<int TG>
++__global__ void __launch_bounds__(256) native_down_tq_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
++                                                             const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_dst,
++                                                             const block_q8_1* __restrict__ hq, NativeExpertLayout L, float* __restrict__ out) {
++    const int ng = *n_groups;
++    if (blockIdx.y >= ng) return;
++    STRATA_SHARED_ALIGN16_U32(s_lut_buf, 1024);
++    __shared__ __align__(16) int4 s_qs[GRP_NC * 20 * 2];
++    __shared__ float s_ds[GRP_NC * 20];
++    const uint16_t* s_lut = (const uint16_t*) stage_iq_grid<TG, true>(s_lut_buf, threadIdx.x, 256);
++    const int sub = threadIdx.x >> 3, t = threadIdx.x & 7;
++    const int rin = (sub & 3) * 8 + (sub >> 2);     // 1 つの warp の 4 行は同じ偶奇（warp 番号 w = sub>>2、行 = 8q + w）
++    for (int g = blockIdx.y; g < ng; g += gridDim.y) {
++        const uint8_t* gp = (const uint8_t*) grp_ptr[g];
++        const float sd = L.tail_off ? ((const float*) (grp_ptr[g] + L.tail_off))[2] : 1.0f;
++        const int e0 = grp_start[g], e1 = grp_start[g + 1];
++        for (int e = e0; e < e1; e += GRP_NC) {
++            const int n = min(GRP_NC, e1 - e);
++            __syncthreads();
++            for (int u = threadIdx.x; u < n * 20; u += 256) {
++                const uint32_t* src = reinterpret_cast<const uint32_t*>(hq + (size_t) e * 20 + u);
++                const uint32_t dsw = src[0];
++                s_ds[u] = __low2float(*reinterpret_cast<const __half2*>(&dsw));
++                int4 a, bq;
++                a.x = (int) src[1]; a.y = (int) src[2]; a.z = (int) src[3]; a.w = (int) src[4];
++                bq.x = (int) src[5]; bq.y = (int) src[6]; bq.z = (int) src[7]; bq.w = (int) src[8];
++                s_qs[u * 2] = a; s_qs[u * 2 + 1] = bq;
++            }
++            __syncthreads();
++            for (int rc = blockIdx.x; rc * 32 < L.n_embd; rc += gridDim.x) {
++                const int r = rc * 32 + rin;
++                const uint8_t* wr = gp + L.down_off + (size_t) r * L.d_row;
++                const int rpar = r & 1;
++                if (n == 1) { float s1[1]; dn_tq_pass<TG, 1>(wr, rpar, s_lut, s_qs, s_ds, t, s1); if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s1[0] * sd; }
++                else if (n == 2) { float s2[2]; dn_tq_pass<TG, 2>(wr, rpar, s_lut, s_qs, s_ds, t, s2); if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s2[t] * sd; }
++                else if (n == 3) { float s3[3]; dn_tq_pass<TG, 3>(wr, rpar, s_lut, s_qs, s_ds, t, s3); if (t < 3) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s3[t] * sd; }
++                else { float s4[4]; dn_tq_pass<TG, 4>(wr, rpar, s_lut, s_qs, s_ds, t, s4); if (t < 4) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s4[t] * sd; }
++            }
++        }
++    }
++}
+ template<int TD>
+ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, const int32_t* grp_start,
+                  const int32_t* n_groups, const int32_t* ent_dst, const block_q8_1* hq, const NativeExpertLayout& L,
+@@ -4281,6 +4508,10 @@ void launch_down(dim3 grid, cudaStream_t s, const unsigned long long* grp_ptr, c
+     else if (g_old_kernels || split_off<TD>()) native_down_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+     else if constexpr (kTqType<TD>) {   // the trellis down types: the codebook staged where tq_stage_on() or tq_sub8_on()
+         if (tq_stage_on() || tq_sub8_on()) {
++            if (!g_no_sub16_gu && TD == 144 && L.n_ff == 640 && L.n_embd % 32 == 0) {
++                native_down_tq_kernel<TD><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
++                return;
++            }
+             if (g_no_sub16_gu) native_down_multi_kernel<TD, false, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+             else native_down_multi_kernel<TD, true, true><<<grid, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+         }

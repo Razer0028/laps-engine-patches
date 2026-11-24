@@ -1,0 +1,1528 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index da40874..391ee7c 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1652,6 +1652,58 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.cache_ram_mib = value;
+         }
+     ).set_env("LLAMA_ARG_CACHE_RAM").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
++    add_opt(common_arg(
++        {"--cache-disk"}, "PATH",
++        "directory for the on-disk tier of the prompt cache: entries evicted from RAM are written here and "
++        "loaded back later, also after a restart (default: off, requires cache-ram)",
++        [](common_params & params, const std::string & value) {
++            params.cache_disk_dir = value;
++        }
++    ).set_env("LLAMA_ARG_CACHE_DISK").set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--cache-disk-mib"}, "N",
++        string_format("size limit of the on-disk prompt cache in MiB (default: %d, 0 - no limit)", params.cache_disk_mib),
++        [](common_params & params, int value) {
++            params.cache_disk_mib = value;
++        }
++    ).set_env("LLAMA_ARG_CACHE_DISK_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--cache-disk-min-tokens"}, "N",
++        string_format("only write prompts with at least N tokens to disk (default: %d)", params.cache_disk_min_tokens),
++        [](common_params & params, int value) {
++            params.cache_disk_min_tokens = value;
++        }
++    ).set_env("LLAMA_ARG_CACHE_DISK_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--cache-disk-keep-ckpt"}, "N",
++        string_format("keep only the newest N context checkpoints in a written prompt (default: %d, -1 - all)", params.cache_disk_keep_ckpt),
++        [](common_params & params, int value) {
++            params.cache_disk_keep_ckpt = value;
++        }
++    ).set_env("LLAMA_ARG_CACHE_DISK_KEEP_CKPT").set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--cache-peers"}, "URLS",
++        "comma-separated base URLs of other servers (same model) to fetch stored prompts from, e.g. "
++        "http://192.0.2.10:8741 (default: none, requires cache-disk and cache-peer-key-file)",
++        [](common_params & params, const std::string & value) {
++            params.cache_peers = value;
++        }
++    ).set_env("LLAMA_ARG_CACHE_PEERS").set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--cache-peer-key-file"}, "FNAME",
++        "file with the key shared by the peers; stored prompts are served to and fetched from peers only with it "
++        "(they contain the conversation)",
++        [](common_params & params, const std::string & value) {
++            params.cache_peer_key_file = value;
++        }
++    ).set_env("LLAMA_ARG_CACHE_PEER_KEY_FILE").set_examples({LLAMA_EXAMPLE_SERVER}));
++    add_opt(common_arg(
++        {"--cache-peer-max-kib-per-token"}, "N",
++        string_format("fetch a peer's prompt only if the file is at most N KiB per token it saves (default: %d)", params.cache_peer_max_kib_per_token),
++        [](common_params & params, int value) {
++            params.cache_peer_max_kib_per_token = value;
++        }
++    ).set_env("LLAMA_ARG_CACHE_PEER_MAX_KIB_PER_TOKEN").set_examples({LLAMA_EXAMPLE_SERVER}));
+     add_opt(common_arg(
+         {"-kvu", "--kv-unified"},
+         {"-no-kvu", "--no-kv-unified"},
+diff --git a/common/common.h b/common/common.h
+index 2e15ec3..17691ed 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -613,6 +613,15 @@ struct common_params {
+     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
+     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+ 
++    // on-disk tier of the prompt cache (L.A.P.S patch)
++    std::string cache_disk_dir;                // "" = off
++    int32_t     cache_disk_mib        = 32768; // 0 = no limit
++    int32_t     cache_disk_min_tokens = 4096;  // shorter entries are not written
++    int32_t     cache_disk_keep_ckpt  = -1;    // newest N context checkpoints kept in a file, -1 = all
++    std::string cache_peers;                   // comma-separated base URLs of servers to share stored prompts with
++    std::string cache_peer_key_file;           // file with the shared key (needed to serve and to fetch)
++    int32_t     cache_peer_max_kib_per_token = 32; // fetch only if the file is at most this big per token it saves
++
+     std::string hostname      = "127.0.0.1";
+     std::string public_path   = "";                                                                         // NOLINT
+     std::string api_prefix    = "";                                                                         // NOLINT
+diff --git a/tools/server/CMakeLists.txt b/tools/server/CMakeLists.txt
+index 280bd9e..f6f97a6 100644
+--- a/tools/server/CMakeLists.txt
++++ b/tools/server/CMakeLists.txt
+@@ -23,6 +23,8 @@ add_library(${TARGET} STATIC
+     server-mcp.h
+     server-schema.cpp
+     server-schema.h
++    server-kvstore.cpp
++    server-kvstore.h
+ )
+ 
+ if (BUILD_SHARED_LIBS)
+@@ -31,7 +33,7 @@ endif()
+ 
+ target_include_directories(${TARGET} PRIVATE ../mtmd)
+ target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
+-target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
++target_link_libraries(${TARGET} PUBLIC llama-common mtmd cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
+ 
+ # llama-server-impl: server logic, reusable by app
+ 
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 38d2e5c..caf5217 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -6,6 +6,7 @@
+ #include "server-queue.h"
+ #include "server-schema.h"
+ #include "server-stream.h"
++#include "server-kvstore.h"
+ 
+ #include "build-info.h"
+ #include "common.h"
+@@ -276,6 +277,9 @@ struct server_slot {
+             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+         }
+ 
++        // an entry over the RAM limit goes straight to the on-disk tier
++        prompt_cache.spill_overflow();
++
+         return true;
+     }
+ 
+@@ -930,6 +934,8 @@ public:
+ 
+     ~server_context_impl() {
+         if (!sleeping) {
++            kvstore_save_on_exit();
++
+             // destroy() is already called when entering sleeping state
+             // we don't call it again here to avoid double free
+             destroy();
+@@ -976,6 +982,47 @@ private:
+ 
+     std::unique_ptr<server_prompt_cache> prompt_cache;
+ 
++    // on-disk tier of the prompt cache (L.A.P.S patch)
++    std::unique_ptr<server_kvstore> kvstore;
++
++    // what a stored state depends on: the model, the draft model and the cache types
++    std::string kvstore_fingerprint() const {
++        char desc[256];
++        llama_model_desc(model_tgt, desc, sizeof(desc));
++        std::string fp = string_format("tgt=%s|n_params=%" PRIu64 "|size=%" PRIu64 "|k=%s|v=%s",
++                desc, llama_model_n_params(model_tgt), llama_model_size(model_tgt),
++                ggml_type_name(params_base.cache_type_k), ggml_type_name(params_base.cache_type_v));
++        if (ctx_dft != nullptr) {
++            if (model_dft != nullptr && model_dft != model_tgt) {
++                llama_model_desc(model_dft, desc, sizeof(desc));
++                fp += string_format("|dft=%s|dft_n_params=%" PRIu64 "|dft_size=%" PRIu64,
++                        desc, llama_model_n_params(model_dft), llama_model_size(model_dft));
++            } else {
++                fp += "|dft=same";
++            }
++        }
++        return fp;
++    }
++
++    // keep the live conversations and the RAM cache when the server stops
++    void kvstore_save_on_exit() {
++        if (!kvstore || !prompt_cache || ctx_tgt == nullptr) {
++            return;
++        }
++        const int64_t t_start = ggml_time_ms();
++        for (auto & slot : slots) {
++            if (!slot.is_processing()) {
++                slot.prompt_save(*prompt_cache);
++            }
++        }
++        kvstore->flush();
++        for (const auto & state : prompt_cache->states) {
++            kvstore->spill_sync(state);
++        }
++        kvstore->flush();
++        SRV_INF("kvstore: saved the prompt cache before exit in %" PRId64 " ms\n", ggml_time_ms() - t_start);
++    }
++
+     server_metrics metrics;
+ 
+     json json_ui_settings = json::object();
+@@ -1411,6 +1458,35 @@ private:
+             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
+ 
+             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
++
++            if (!params_base.cache_disk_dir.empty()) {
++                if (!kvstore) {
++                    server_kvstore_params kp;
++                    kp.dir         = params_base.cache_disk_dir;
++                    kp.limit_bytes = 1024ull*1024ull*(size_t) std::max(0, params_base.cache_disk_mib);
++                    kp.min_tokens  = params_base.cache_disk_min_tokens;
++                    kp.keep_ckpt   = params_base.cache_disk_keep_ckpt;
++                    kp.peer_max_kib_per_token = params_base.cache_peer_max_kib_per_token;
++                    for (const auto & url : string_split<std::string>(params_base.cache_peers, ',')) {
++                        const std::string u = string_strip(url);
++                        if (!u.empty()) {
++                            kp.peers.push_back(u);
++                        }
++                    }
++                    if (!params_base.cache_peer_key_file.empty()) {
++                        std::ifstream f(params_base.cache_peer_key_file);
++                        std::string key((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
++                        kp.peer_key = string_strip(key);
++                        if (kp.peer_key.size() < 16) {
++                            SRV_ERR("kvstore: the key in %s is missing or shorter than 16 characters, not sharing\n",
++                                    params_base.cache_peer_key_file.c_str());
++                            kp.peer_key.clear();
++                        }
++                    }
++                    kvstore = std::make_unique<server_kvstore>(kp, kvstore_fingerprint());
++                }
++                prompt_cache->store = kvstore.get();
++            }
+         } else {
+             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+         }
+diff --git a/tools/server/server-kvstore.cpp b/tools/server/server-kvstore.cpp
+new file mode 100644
+index 0000000..1e28809
+--- /dev/null
++++ b/tools/server/server-kvstore.cpp
+@@ -0,0 +1,874 @@
++#include "server-kvstore.h"
++
++#include "server-common.h"
++
++#include <cpp-httplib/httplib.h>
++
++#include <atomic>
++#include <chrono>
++#include <cinttypes>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <list>
++
++namespace fs = std::filesystem;
++
++static const char     BWKV_MAGIC[4]   = { 'B', 'W', 'K', 'V' };
++static const char     BWKV_END[4]     = { 'B', 'W', 'K', 'E' };
++static const uint32_t BWKV_VERSION    = 1;
++static const char *   BWKV_EXT        = ".bwkv";
++static const size_t   BWKV_BLOCK      = 256;  // tokens per prefix hash
++static const int64_t  PEER_REFRESH_S  = 10;
++static const int64_t  PEER_STALE_S    = 60;
++static const char *   PEER_KEY_HEADER = "X-Kvstore-Key";
++
++static std::atomic<server_kvstore *> g_instance{nullptr};
++
++static int64_t kv_now_s() {
++    return std::chrono::duration_cast<std::chrono::seconds>(std::chrono::system_clock::now().time_since_epoch()).count();
++}
++
++static int64_t kv_now_ms() {
++    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
++}
++
++static void kv_fnv(uint64_t & h, llama_token t) {
++    const uint32_t v = (uint32_t) t;
++    for (int i = 0; i < 4; ++i) {
++        h ^= (v >> (8*i)) & 0xff;
++        h *= 1099511628211ULL;
++    }
++}
++
++static std::string kv_make_id(const llama_tokens & tokens) {
++    uint64_t h = 1469598103934665603ULL;
++    for (const llama_token t : tokens) {
++        kv_fnv(h, t);
++    }
++    char buf[64];
++    snprintf(buf, sizeof(buf), "%016" PRIx64 "-%zu", h, tokens.size());
++    return buf;
++}
++
++// hash of tokens[0, k*BWKV_BLOCK) for k = 1, 2, ... - two prompts share a prefix of k blocks
++// exactly when their first k hashes are equal, so a peer can be matched without its tokens
++static std::vector<uint64_t> kv_block_hashes(const llama_tokens & tokens) {
++    std::vector<uint64_t> out;
++    out.reserve(tokens.size() / BWKV_BLOCK);
++    uint64_t h = 1469598103934665603ULL;
++    for (size_t i = 0; i < tokens.size(); ++i) {
++        kv_fnv(h, tokens[i]);
++        if ((i + 1) % BWKV_BLOCK == 0) {
++            out.push_back(h);
++        }
++    }
++    return out;
++}
++
++// the token list including LLAMA_TOKEN_NULL where media sits. server_tokens::get_tokens() can't be
++// used: it aborts whenever the server has a multimodal projector loaded, even for text-only prompts
++static llama_tokens kv_raw_tokens(const server_tokens & t) {
++    llama_tokens out(t.size());
++    for (size_t i = 0; i < t.size(); ++i) {
++        out[i] = t[i];
++    }
++    return out;
++}
++
++static size_t kv_common_prefix(const llama_tokens & a, const llama_tokens & b) {
++    const size_t n = std::min(a.size(), b.size());
++    size_t i = 0;
++    while (i < n && a[i] == b[i] && a[i] != LLAMA_TOKEN_NULL) {
++        ++i;
++    }
++    return i;
++}
++
++static bool kv_valid_id(const std::string & id) {
++    if (id.empty() || id.size() > 64) {
++        return false;
++    }
++    for (const char c : id) {
++        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || c == '-')) {
++            return false;
++        }
++    }
++    return true;
++}
++
++//
++// file i/o helpers
++//
++
++namespace {
++
++struct kv_file {
++    FILE * f = nullptr;
++    std::vector<char> buf;
++
++    kv_file(const std::string & path, const char * mode) {
++        f = fopen(path.c_str(), mode);
++        if (f) {
++            buf.resize(8u << 20);
++            setvbuf(f, buf.data(), _IOFBF, buf.size());
++        }
++    }
++    ~kv_file() {
++        if (f) {
++            fclose(f);
++        }
++    }
++
++    bool ok() const { return f != nullptr; }
++
++    bool put(const void * p, size_t n) { return n == 0 || fwrite(p, 1, n, f) == n; }
++    bool get(void * p, size_t n)       { return n == 0 || fread(p, 1, n, f) == n; }
++
++    template <typename T> bool put_v(T v) { return put(&v, sizeof(v)); }
++    template <typename T> bool get_v(T & v) { return get(&v, sizeof(v)); }
++
++    bool put_bytes(const std::vector<uint8_t> & v) {
++        return put_v<uint64_t>(v.size()) && put(v.data(), v.size());
++    }
++
++    bool get_bytes(std::vector<uint8_t> & v, uint64_t max_len) {
++        uint64_t n = 0;
++        if (!get_v(n) || n > max_len) {
++            return false;
++        }
++        v.resize(n);
++        return get(v.data(), n);
++    }
++
++    bool close() {
++        if (!f) {
++            return false;
++        }
++        const bool flushed = fflush(f) == 0;
++        const bool closed  = fclose(f) == 0;
++        f = nullptr;
++        return flushed && closed;
++    }
++};
++
++// reads magic, version, fingerprint and tokens; returns false if the file is not ours or is damaged
++bool kv_read_head(kv_file & in, uint64_t file_size, std::string & fp, llama_tokens & tokens) {
++    char magic[4];
++    uint32_t version = 0;
++    uint32_t fp_len  = 0;
++    if (!in.get(magic, 4) || memcmp(magic, BWKV_MAGIC, 4) != 0) {
++        return false;
++    }
++    if (!in.get_v(version) || version != BWKV_VERSION) {
++        return false;
++    }
++    if (!in.get_v(fp_len) || fp_len > 4096) {
++        return false;
++    }
++    fp.resize(fp_len);
++    if (!in.get(fp.data(), fp_len)) {
++        return false;
++    }
++    uint64_t n_tokens = 0;
++    if (!in.get_v(n_tokens) || n_tokens > file_size / sizeof(llama_token)) {
++        return false;
++    }
++    tokens.resize(n_tokens);
++    return in.get(tokens.data(), n_tokens * sizeof(llama_token));
++}
++
++} // namespace
++
++//
++// server_kvstore
++//
++
++server_kvstore::server_kvstore(const server_kvstore_params & params, std::string fingerprint)
++    : params(params), fingerprint(std::move(fingerprint)) {
++    scan();
++    worker = std::thread([this]() { worker_loop(); });
++
++    if (!this->params.peers.empty()) {
++        if (this->params.peer_key.empty()) {
++            SRV_WRN("%s", "kvstore: --cache-peers needs --cache-peer-key-file, not using peers\n");
++            this->params.peers.clear();
++        } else {
++            for (const auto & url : this->params.peers) {
++                peer_states.push_back({ url, false, 0, {} });
++            }
++            peer_thread = std::thread([this]() { peer_loop(); });
++        }
++    }
++
++    g_instance.store(this);
++}
++
++server_kvstore::~server_kvstore() {
++    g_instance.store(nullptr);
++    {
++        std::lock_guard<std::mutex> lk(mtx_q);
++        stopping = true;
++    }
++    cv_q.notify_all();
++    if (worker.joinable()) {
++        worker.join();
++    }
++    if (peer_thread.joinable()) {
++        peer_thread.join();
++    }
++}
++
++server_kvstore * server_kvstore::instance() {
++    return g_instance.load();
++}
++
++bool server_kvstore::add_file(const std::string & id, const std::string & path) {
++    std::error_code ec;
++    const uint64_t size = fs::file_size(path, ec);
++    if (ec) {
++        return false;
++    }
++    kv_file in(path, "rb");
++    if (!in.ok()) {
++        return false;
++    }
++    std::string fp;
++    llama_tokens tokens;
++    try {
++        if (!kv_read_head(in, size, fp, tokens)) {
++            return false;
++        }
++    } catch (const std::exception &) {
++        return false;
++    }
++
++    entry e;
++    e.path   = path;
++    e.bytes  = size;
++    e.usable = fp == fingerprint;
++    if (e.usable) {
++        e.hashes = kv_block_hashes(tokens);
++        e.tokens = std::move(tokens);
++    }
++    const auto mtime = fs::last_write_time(path, ec);
++    e.t_used = std::chrono::duration_cast<std::chrono::seconds>(
++            (mtime - fs::file_time_type::clock::now()) + std::chrono::system_clock::now().time_since_epoch()).count();
++
++    std::lock_guard<std::mutex> lk(mtx);
++    index[id] = std::move(e);
++    return true;
++}
++
++void server_kvstore::scan() {
++    std::error_code ec;
++    fs::create_directories(params.dir, ec);
++    if (ec) {
++        SRV_ERR("kvstore: cannot create %s: %s\n", params.dir.c_str(), ec.message().c_str());
++        return;
++    }
++
++    for (const auto & de : fs::directory_iterator(params.dir, ec)) {
++        if (!de.is_regular_file()) {
++            continue;
++        }
++        const std::string name = de.path().filename().string();
++        if (name.rfind(".tmp-", 0) == 0) {
++            // left over from an interrupted write or download
++            fs::remove(de.path(), ec);
++            continue;
++        }
++        if (de.path().extension() != BWKV_EXT) {
++            continue;
++        }
++        if (!add_file(de.path().stem().string(), de.path().string())) {
++            SRV_WRN("kvstore: ignoring unreadable file %s\n", name.c_str());
++        }
++    }
++
++    size_t n_usable = 0;
++    size_t bytes_usable = 0;
++    size_t bytes_total = 0;
++    {
++        std::lock_guard<std::mutex> lk(mtx);
++        for (const auto & [id, e] : index) {
++            bytes_total += e.bytes;
++            if (e.usable) {
++                n_usable++;
++                bytes_usable += e.bytes;
++            }
++        }
++    }
++
++    SRV_INF("kvstore: %s: %zu entries for this model (%.1f MiB), %zu files in total (%.1f MiB), limit %.1f MiB, %zu peers, serving %s\n",
++            params.dir.c_str(), n_usable, bytes_usable / 1048576.0, index.size(), bytes_total / 1048576.0,
++            params.limit_bytes / 1048576.0, params.peers.size(), serving() ? "on" : "off");
++}
++
++void server_kvstore::spill(server_prompt_cache_state && state) {
++    if (state.prompt.n_tokens() < params.min_tokens || state.prompt.tokens.has_media()) {
++        return;
++    }
++
++    std::unique_lock<std::mutex> lk(mtx_q);
++    // back-pressure: at most one entry waiting while another one is being written
++    cv_q.wait(lk, [this]() { return queue.empty() || stopping; });
++    if (stopping) {
++        return;
++    }
++    queue.push_back(std::move(state));
++    cv_q.notify_all();
++}
++
++void server_kvstore::spill_sync(const server_prompt_cache_state & state) {
++    if (state.prompt.n_tokens() < params.min_tokens || state.prompt.tokens.has_media()) {
++        return;
++    }
++    write(state);
++}
++
++void server_kvstore::flush() {
++    std::unique_lock<std::mutex> lk(mtx_q);
++    cv_q.wait(lk, [this]() { return queue.empty() && !busy; });
++}
++
++void server_kvstore::worker_loop() {
++    while (true) {
++        server_prompt_cache_state state;
++        {
++            std::unique_lock<std::mutex> lk(mtx_q);
++            cv_q.wait(lk, [this]() { return stopping || !queue.empty(); });
++            if (queue.empty()) {
++                break; // stopping and nothing left to write
++            }
++            state = std::move(queue.front());
++            queue.pop_front();
++            busy = true;
++        }
++        cv_q.notify_all();
++
++        write(state);
++
++        {
++            std::lock_guard<std::mutex> lk(mtx_q);
++            busy = false;
++        }
++        cv_q.notify_all();
++    }
++}
++
++bool server_kvstore::write(const server_prompt_cache_state & state) {
++    const int64_t t_start = kv_now_ms();
++
++    const llama_tokens tokens = kv_raw_tokens(state.prompt.tokens);
++    const std::string id = kv_make_id(tokens);
++
++    {
++        std::lock_guard<std::mutex> lk(mtx);
++        for (auto & [eid, e] : index) {
++            if (!e.usable) {
++                continue;
++            }
++            // the same prompt, or one that contains it, is already stored
++            if (e.tokens.size() >= tokens.size() && kv_common_prefix(e.tokens, tokens) == tokens.size()) {
++                e.t_used = kv_now_s();
++                return true;
++            }
++        }
++    }
++
++    // which checkpoints go into the file
++    size_t n_ckpt = state.prompt.checkpoints.size();
++    size_t skip   = 0;
++    if (params.keep_ckpt >= 0 && n_ckpt > (size_t) params.keep_ckpt) {
++        skip   = n_ckpt - params.keep_ckpt;
++        n_ckpt = params.keep_ckpt;
++    }
++
++    static std::atomic<uint64_t> tmp_counter{0};
++    const std::string path_final = (fs::path(params.dir) / (id + BWKV_EXT)).string();
++    const std::string path_tmp   = (fs::path(params.dir) / (".tmp-" + id + "-" + std::to_string(tmp_counter++))).string();
++
++    bool ok = false;
++    {
++        kv_file out(path_tmp, "wb");
++        if (out.ok()) {
++            ok = out.put(BWKV_MAGIC, 4)
++              && out.put_v<uint32_t>(BWKV_VERSION)
++              && out.put_v<uint32_t>(fingerprint.size())
++              && out.put(fingerprint.data(), fingerprint.size())
++              && out.put_v<uint64_t>(tokens.size())
++              && out.put(tokens.data(), tokens.size() * sizeof(llama_token))
++              && out.put_v<uint32_t>(n_ckpt);
++
++            size_t i = 0;
++            for (const auto & ckpt : state.prompt.checkpoints) {
++                if (!ok) {
++                    break;
++                }
++                if (i++ < skip) {
++                    continue;
++                }
++                ok = out.put_v<int64_t>(ckpt.n_tokens)
++                  && out.put_v<int32_t>(ckpt.id_task)
++                  && out.put_v<int32_t>(ckpt.pos_min)
++                  && out.put_v<int32_t>(ckpt.pos_max)
++                  && out.put_bytes(ckpt.data_tgt)
++                  && out.put_bytes(ckpt.data_dft)
++                  && out.put_bytes(ckpt.data_spec);
++            }
++
++            ok = ok
++              && out.put_bytes(state.data.main)
++              && out.put_bytes(state.data.drft)
++              && out.put(BWKV_END, 4);
++            ok = out.close() && ok;
++        }
++    }
++
++    std::error_code ec;
++    if (ok) {
++        fs::rename(path_tmp, path_final, ec);
++        ok = !ec;
++    }
++    if (!ok) {
++        fs::remove(path_tmp, ec);
++        SRV_ERR("kvstore: failed to write %s\n", path_final.c_str());
++        return false;
++    }
++
++    const uint64_t bytes = fs::file_size(path_final, ec);
++
++    size_t n_obsolete = 0;
++    {
++        std::lock_guard<std::mutex> lk(mtx);
++        // drop stored prompts that are fully contained in the new one
++        for (auto it = index.begin(); it != index.end();) {
++            if (it->second.usable && it->first != id && it->second.tokens.size() < tokens.size() &&
++                kv_common_prefix(it->second.tokens, tokens) == it->second.tokens.size()) {
++                fs::remove(it->second.path, ec);
++                it = index.erase(it);
++                n_obsolete++;
++            } else {
++                ++it;
++            }
++        }
++
++        entry e;
++        e.path   = path_final;
++        e.tokens = tokens;
++        e.hashes = kv_block_hashes(tokens);
++        e.bytes  = bytes;
++        e.t_used = kv_now_s();
++        e.usable = true;
++        index[id] = std::move(e);
++    }
++
++    enforce_limit(id);
++
++    SRV_INF("kvstore: wrote %s: %zu tokens, %zu checkpoints, %.1f MiB in %" PRId64 " ms (replaced %zu)\n",
++            id.c_str(), tokens.size(), n_ckpt, bytes / 1048576.0, kv_now_ms() - t_start, n_obsolete);
++
++    return true;
++}
++
++void server_kvstore::enforce_limit(const std::string & keep_id) {
++    if (params.limit_bytes == 0) {
++        return;
++    }
++    std::lock_guard<std::mutex> lk(mtx);
++
++    size_t total = 0;
++    for (const auto & [id, e] : index) {
++        total += e.bytes;
++    }
++
++    std::error_code ec;
++    while (total > params.limit_bytes) {
++        auto oldest = index.end();
++        for (auto it = index.begin(); it != index.end(); ++it) {
++            if (it->first == keep_id) {
++                continue;
++            }
++            if (oldest == index.end() || it->second.t_used < oldest->second.t_used) {
++                oldest = it;
++            }
++        }
++        if (oldest == index.end()) {
++            break;
++        }
++        SRV_INF("kvstore: limit reached, removing %s (%.1f MiB)\n", oldest->first.c_str(), oldest->second.bytes / 1048576.0);
++        total -= oldest->second.bytes;
++        fs::remove(oldest->second.path, ec);
++        index.erase(oldest);
++    }
++}
++
++bool server_kvstore::find(const server_tokens & tokens_new, int lcp_best, float f_keep_best, float f_sim_best, candidate & out) {
++    const llama_tokens tn = kv_raw_tokens(tokens_new);
++    if (tn.empty()) {
++        return false;
++    }
++
++    bool found = false;
++
++    std::lock_guard<std::mutex> lk(mtx);
++    for (const auto & [id, e] : index) {
++        if (!e.usable || e.tokens.empty()) {
++            continue;
++        }
++        const int lcp = (int) kv_common_prefix(e.tokens, tn);
++
++        const float f_keep = float(lcp) / e.tokens.size();
++        const float f_sim  = float(lcp) / tn.size();
++
++        // same rule as the RAM cache: don't trash large prompts
++        if (f_keep < 0.25f) {
++            continue;
++        }
++
++        // reading the file has to be cheaper than recomputing what it saves
++        const int gain = lcp - lcp_best;
++        if (gain < 1024 || e.bytes > (size_t) gain * 256 * 1024) {
++            continue;
++        }
++
++        if (f_keep_best < f_keep && f_sim_best < f_sim) {
++            f_keep_best = f_keep;
++            f_sim_best  = f_sim;
++
++            out.peer.clear();
++            out.id     = id;
++            out.lcp    = lcp;
++            out.f_keep = f_keep;
++            out.f_sim  = f_sim;
++            out.bytes  = e.bytes;
++
++            found = true;
++        }
++    }
++
++    return found;
++}
++
++bool server_kvstore::read(const std::string & id, bool has_mtmd, server_prompt_cache_state & out) {
++    std::string path;
++    uint64_t size = 0;
++    {
++        std::lock_guard<std::mutex> lk(mtx);
++        auto it = index.find(id);
++        if (it == index.end()) {
++            return false;
++        }
++        path = it->second.path;
++        size = it->second.bytes;
++    }
++
++    const int64_t t_start = kv_now_ms();
++
++    kv_file in(path, "rb");
++    std::string fp;
++    llama_tokens tokens;
++    std::list<common_prompt_checkpoint> checkpoints;
++    uint32_t n_ckpt = 0;
++    server_prompt_data data;
++    bool ok = false;
++
++    try {
++    ok = in.ok() && kv_read_head(in, size, fp, tokens) && fp == fingerprint;
++
++    ok = ok && in.get_v(n_ckpt);
++    for (uint32_t i = 0; ok && i < n_ckpt; ++i) {
++        common_prompt_checkpoint ckpt;
++        int32_t id_task = -1;
++        int32_t pos_min = 0;
++        int32_t pos_max = 0;
++        ok = in.get_v(ckpt.n_tokens)
++          && in.get_v(id_task)
++          && in.get_v(pos_min)
++          && in.get_v(pos_max)
++          && in.get_bytes(ckpt.data_tgt,  size)
++          && in.get_bytes(ckpt.data_dft,  size)
++          && in.get_bytes(ckpt.data_spec, size);
++        ckpt.id_task = id_task;
++        ckpt.pos_min = pos_min;
++        ckpt.pos_max = pos_max;
++        if (ok) {
++            checkpoints.push_back(std::move(ckpt));
++        }
++    }
++
++    char end[4];
++    ok = ok
++      && in.get_bytes(data.main, size)
++      && in.get_bytes(data.drft, size)
++      && in.get(end, 4) && memcmp(end, BWKV_END, 4) == 0;
++    } catch (const std::exception & e) {
++        SRV_WRN("kvstore: reading %s failed: %s\n", id.c_str(), e.what());
++        ok = false;
++    }
++
++    if (!ok) {
++        SRV_WRN("kvstore: cannot use %s, removing it\n", id.c_str());
++        std::lock_guard<std::mutex> lk(mtx);
++        std::error_code ec;
++        fs::remove(path, ec);
++        index.erase(id);
++        return false;
++    }
++
++    out.prompt.tokens      = server_tokens(tokens, has_mtmd);
++    out.prompt.checkpoints = std::move(checkpoints);
++    out.data               = std::move(data);
++
++    {
++        std::lock_guard<std::mutex> lk(mtx);
++        auto it = index.find(id);
++        if (it != index.end()) {
++            it->second.t_used = kv_now_s();
++        }
++        std::error_code ec;
++        fs::last_write_time(path, fs::file_time_type::clock::now(), ec);
++    }
++
++    SRV_INF("kvstore: read %s: %zu tokens, %u checkpoints, %.1f MiB in %" PRId64 " ms\n",
++            id.c_str(), tokens.size(), n_ckpt, size / 1048576.0, kv_now_ms() - t_start);
++
++    return true;
++}
++
++//
++// network
++//
++
++bool server_kvstore::check_key(const std::string & key) const {
++    const std::string & want = params.peer_key;
++    if (want.empty() || key.size() != want.size()) {
++        return false;
++    }
++    unsigned char diff = 0;
++    for (size_t i = 0; i < want.size(); ++i) {
++        diff |= (unsigned char) (want[i] ^ key[i]);
++    }
++    return diff == 0;
++}
++
++std::string server_kvstore::index_json() {
++    json entries = json::array();
++    {
++        std::lock_guard<std::mutex> lk(mtx);
++        for (const auto & [id, e] : index) {
++            if (!e.usable) {
++                continue;
++            }
++            entries.push_back({
++                { "id",       id },
++                { "n_tokens", e.tokens.size() },
++                { "bytes",    e.bytes },
++                { "hashes",   e.hashes },
++            });
++        }
++    }
++    return json {
++        { "fingerprint", fingerprint },
++        { "block",       BWKV_BLOCK },
++        { "entries",     entries },
++    }.dump();
++}
++
++bool server_kvstore::blob_path(const std::string & id, std::string & path, size_t & size) {
++    if (!kv_valid_id(id)) {
++        return false;
++    }
++    std::lock_guard<std::mutex> lk(mtx);
++    auto it = index.find(id);
++    if (it == index.end() || !it->second.usable) {
++        return false;
++    }
++    path = it->second.path;
++    size = it->second.bytes;
++    return true;
++}
++
++void server_kvstore::peer_loop() {
++    while (true) {
++        for (size_t i = 0; ; ++i) {
++            std::string url;
++            {
++                std::lock_guard<std::mutex> lk(mtx_peers);
++                if (i >= peer_states.size()) {
++                    break;
++                }
++                url = peer_states[i].url;
++            }
++
++            std::vector<peer_entry> entries;
++            bool fp_ok = false;
++            bool ok    = false;
++            try {
++                httplib::Client cli(url);
++                cli.set_connection_timeout(3, 0);
++                cli.set_read_timeout(10, 0);
++                auto res = cli.Get("/kvstore/index", httplib::Headers{ { PEER_KEY_HEADER, params.peer_key } });
++                if (res && res->status == 200) {
++                    const json j = json::parse(res->body);
++                    fp_ok = j.value("fingerprint", std::string()) == fingerprint && j.value("block", (size_t) 0) == BWKV_BLOCK;
++                    for (const auto & je : j.at("entries")) {
++                        peer_entry pe;
++                        pe.id       = je.at("id").get<std::string>();
++                        pe.n_tokens = je.at("n_tokens").get<size_t>();
++                        pe.bytes    = je.at("bytes").get<size_t>();
++                        pe.hashes   = je.at("hashes").get<std::vector<uint64_t>>();
++                        if (kv_valid_id(pe.id)) {
++                            entries.push_back(std::move(pe));
++                        }
++                    }
++                    ok = true;
++                }
++            } catch (const std::exception & e) {
++                SRV_DBG("kvstore: peer %s: %s\n", url.c_str(), e.what());
++            }
++
++            std::lock_guard<std::mutex> lk(mtx_peers);
++            auto & ps = peer_states[i];
++            if (ok) {
++                if (!fp_ok && (ps.fp_ok || ps.t_ok == 0)) {
++                    SRV_INF("kvstore: peer %s runs a different model or cache setup, not using it\n", url.c_str());
++                }
++                ps.fp_ok   = fp_ok;
++                ps.t_ok    = kv_now_s();
++                ps.entries = std::move(entries);
++            }
++        }
++
++        std::unique_lock<std::mutex> lk(mtx_q);
++        if (cv_q.wait_for(lk, std::chrono::seconds(PEER_REFRESH_S), [this]() { return stopping; })) {
++            break;
++        }
++    }
++}
++
++bool server_kvstore::find_remote(const server_tokens & tokens_new, int lcp_best, float f_keep_best, float f_sim_best, candidate & out) {
++    if (params.peers.empty()) {
++        return false;
++    }
++    const llama_tokens tn = kv_raw_tokens(tokens_new);
++    if (tn.size() < BWKV_BLOCK) {
++        return false;
++    }
++    const std::vector<uint64_t> hn = kv_block_hashes(tn);
++
++    bool found = false;
++    const int64_t now = kv_now_s();
++
++    std::lock_guard<std::mutex> lk(mtx_peers);
++    for (const auto & ps : peer_states) {
++        if (!ps.fp_ok || now - ps.t_ok > PEER_STALE_S) {
++            continue;
++        }
++        for (const auto & pe : ps.entries) {
++            if (pe.n_tokens == 0) {
++                continue;
++            }
++            const size_t m = std::min(pe.hashes.size(), hn.size());
++            size_t k = 0;
++            while (k < m && pe.hashes[k] == hn[k]) {
++                ++k;
++            }
++            const int lcp = (int) (k * BWKV_BLOCK); // a lower bound of the real common prefix
++
++            const float f_keep = float(lcp) / pe.n_tokens;
++            const float f_sim  = float(lcp) / tn.size();
++
++            if (f_keep < 0.25f) {
++                continue;
++            }
++
++            // sending the file has to be cheaper than recomputing what it saves
++            const int gain = lcp - lcp_best;
++            if (gain < 1024 || pe.bytes > (size_t) gain * params.peer_max_kib_per_token * 1024) {
++                continue;
++            }
++
++            if (f_keep_best < f_keep && f_sim_best < f_sim) {
++                f_keep_best = f_keep;
++                f_sim_best  = f_sim;
++
++                out.peer   = ps.url;
++                out.id     = pe.id;
++                out.lcp    = lcp;
++                out.f_keep = f_keep;
++                out.f_sim  = f_sim;
++                out.bytes  = pe.bytes;
++
++                found = true;
++            }
++        }
++    }
++
++    return found;
++}
++
++bool server_kvstore::fetch(const candidate & c) {
++    if (c.peer.empty() || !kv_valid_id(c.id)) {
++        return false;
++    }
++
++    static std::atomic<uint64_t> tmp_counter{0};
++    const std::string path_final = (fs::path(params.dir) / (c.id + BWKV_EXT)).string();
++    const std::string path_tmp   = (fs::path(params.dir) / (".tmp-fetch-" + c.id + "-" + std::to_string(tmp_counter++))).string();
++
++    const int64_t t_start = kv_now_ms();
++
++    bool ok = false;
++    size_t received = 0;
++    {
++        kv_file out(path_tmp, "wb");
++        if (out.ok()) {
++            try {
++                httplib::Client cli(c.peer);
++                cli.set_connection_timeout(3, 0);
++                cli.set_read_timeout(30, 0);
++                auto res = cli.Get("/kvstore/blob/" + c.id, httplib::Headers{ { PEER_KEY_HEADER, params.peer_key } },
++                    [&](const char * data, size_t len) {
++                        received += len;
++                        return received <= c.bytes && out.put(data, len);
++                    });
++                ok = res && res->status == 200 && received == c.bytes;
++            } catch (const std::exception & e) {
++                SRV_WRN("kvstore: fetch from %s failed: %s\n", c.peer.c_str(), e.what());
++            }
++            ok = out.close() && ok;
++        }
++    }
++
++    std::error_code ec;
++    if (ok) {
++        fs::rename(path_tmp, path_final, ec);
++        ok = !ec;
++    }
++    // the file has to be what we asked for: our model, and the tokens the id names
++    if (ok) {
++        ok = add_file(c.id, path_final);
++        std::lock_guard<std::mutex> lk(mtx);
++        auto it = index.find(c.id);
++        ok = ok && it != index.end() && it->second.usable && kv_make_id(it->second.tokens) == c.id;
++        if (!ok && it != index.end()) {
++            index.erase(it);
++        }
++    }
++    if (!ok) {
++        fs::remove(path_tmp, ec);
++        fs::remove(path_final, ec);
++        SRV_WRN("kvstore: could not fetch %s from %s (%zu of %zu bytes)\n", c.id.c_str(), c.peer.c_str(), received, c.bytes);
++        return false;
++    }
++
++    enforce_limit(c.id);
++
++    const int64_t t_ms = std::max<int64_t>(1, kv_now_ms() - t_start);
++    SRV_INF("kvstore: fetched %s from %s: %.1f MiB in %" PRId64 " ms (%.1f MiB/s)\n",
++            c.id.c_str(), c.peer.c_str(), c.bytes / 1048576.0, t_ms, c.bytes / 1048576.0 / (t_ms / 1000.0));
++
++    return true;
++}
+diff --git a/tools/server/server-kvstore.h b/tools/server/server-kvstore.h
+new file mode 100644
+index 0000000..253272b
+--- /dev/null
++++ b/tools/server/server-kvstore.h
+@@ -0,0 +1,128 @@
++#pragma once
++
++// on-disk and network tier for server_prompt_cache (L.A.P.S patch)
++//
++// entries evicted from the RAM prompt cache are written to a directory instead of being dropped,
++// and can be loaded back later - also after the server was restarted. the file holds everything
++// the RAM entry holds (tokens, context checkpoints, target and draft state), so a loaded entry
++// behaves exactly like a RAM hit.
++//
++// servers that run the same model can share their stored entries over HTTP (--cache-peers): when
++// a prompt is not cached locally, a peer that has it sends the file instead of the prompt being
++// processed again. the transfer needs a shared key because the file contains the conversation.
++
++#include "server-task.h"
++
++#include <condition_variable>
++#include <cstdint>
++#include <deque>
++#include <map>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++struct server_kvstore_params {
++    std::string dir;
++
++    size_t limit_bytes = 0;    // 0 = no limit
++    int    min_tokens  = 4096; // smaller entries are cheap to recompute and are not written
++    int    keep_ckpt   = -1;   // keep only the newest N context checkpoints in a file (-1 = all)
++
++    std::vector<std::string> peers;    // base URLs of other servers, e.g. http://192.0.2.10:8741
++    std::string peer_key;              // shared secret; empty = no serving and no fetching
++    int         peer_max_kib_per_token = 32; // fetch only if the file is at most this big per token it saves
++};
++
++struct server_kvstore {
++    struct candidate {
++        std::string peer; // empty = local file
++        std::string id;
++        int    lcp    = 0;
++        float  f_keep = 0.0f;
++        float  f_sim  = 0.0f;
++        size_t bytes  = 0;
++    };
++
++    // fingerprint: model and cache parameters - a file is only used if it matches exactly
++    server_kvstore(const server_kvstore_params & params, std::string fingerprint);
++    ~server_kvstore();
++
++    // the store of this process, for the HTTP handlers (nullptr if there is none)
++    static server_kvstore * instance();
++
++    // take over an entry evicted from RAM; it is written in the background
++    void spill(server_prompt_cache_state && state);
++
++    // write an entry right now (used when the server exits)
++    void spill_sync(const server_prompt_cache_state & state);
++
++    // the stored entry that would preserve more context than (f_keep_best, f_sim_best), if any
++    bool find(const server_tokens & tokens_new, int lcp_best, float f_keep_best, float f_sim_best, candidate & out);
++
++    // the same, among the entries the peers have
++    bool find_remote(const server_tokens & tokens_new, int lcp_best, float f_keep_best, float f_sim_best, candidate & out);
++
++    // download a peer's entry into this store; afterwards read(c.id) works
++    bool fetch(const candidate & c);
++
++    // read an entry back into a cache state
++    bool read(const std::string & id, bool has_mtmd, server_prompt_cache_state & out);
++
++    // wait until all background writes are done
++    void flush();
++
++    // serving side
++    bool        serving() const { return !params.peer_key.empty(); }
++    bool        check_key(const std::string & key) const;
++    std::string index_json();
++    bool        blob_path(const std::string & id, std::string & path, size_t & size);
++
++private:
++    struct entry {
++        std::string  path;
++        llama_tokens tokens; // empty if the file belongs to another model
++        std::vector<uint64_t> hashes; // prefix hash after every block of tokens
++        size_t       bytes  = 0;
++        int64_t      t_used = 0;
++        bool         usable = false;
++    };
++
++    struct peer_entry {
++        std::string id;
++        size_t      n_tokens = 0;
++        size_t      bytes    = 0;
++        std::vector<uint64_t> hashes;
++    };
++
++    struct peer_state {
++        std::string url;
++        bool        fp_ok = false;
++        int64_t     t_ok  = 0;
++        std::vector<peer_entry> entries;
++    };
++
++    server_kvstore_params params;
++    std::string fingerprint;
++
++    std::mutex mtx;               // guards index
++    std::map<std::string, entry> index;
++
++    std::mutex mtx_q;             // guards queue / busy / stopping
++    std::condition_variable cv_q;
++    std::deque<server_prompt_cache_state> queue;
++    bool busy = false;
++    bool stopping = false;
++    std::thread worker;
++
++    std::mutex mtx_peers;         // guards peer_states
++    std::vector<peer_state> peer_states;
++    std::thread peer_thread;
++
++    void scan();
++    void worker_loop();
++    void peer_loop();
++    bool write(const server_prompt_cache_state & state);
++    bool add_file(const std::string & id, const std::string & path);
++    void enforce_limit(const std::string & keep_id);
++};
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 1ee6775..afd322d 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -9,6 +9,7 @@
+ #include "sampling.h"
+ #include "speculative.h"
+ #include "server-common.h"
++#include "server-kvstore.h"
+ 
+ using json = nlohmann::ordered_json;
+ 
+@@ -1682,6 +1683,20 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+ 
+     // skip over-limit entries to avoid disturbing the cache
+     if (limit_size > 0 && state_size_new > limit_size) {
++        if (store) {
++            // too big for RAM, but the store can keep it
++            overflow.clear();
++            try {
++                overflow.push_back({
++                    /*.prompt =*/ { prompt.tokens.clone(), prompt.checkpoints },
++                    /*.data   =*/ { std::vector<uint8_t>(state_size_tgt), std::vector<uint8_t>(state_size_dft) },
++                });
++            } catch (const std::bad_alloc &) {
++                overflow.clear();
++                return nullptr;
++            }
++            return &overflow.back();
++        }
+         SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
+                 state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+         return nullptr;
+@@ -1706,7 +1721,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+             SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                     states.front().size() / (1024.0 * 1024.0));
+ 
+-            states.pop_front();
++            pop_oldest();
+         }
+     }
+ 
+@@ -1745,6 +1760,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+ 
+ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
++    int lcp_best_cur = lcp_best;
+ 
+     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
+     float f_sim_best  = float(lcp_best) / tokens_new.size();
+@@ -1772,6 +1788,53 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+             f_sim_best  = f_sim_cur;
+ 
+             it_best = it;
++            lcp_best_cur = lcp_cur;
++        }
++    }
++
++    // a stored entry on disk, or one a peer has, may preserve more of the context than anything in RAM
++    if (store) {
++        server_kvstore::candidate cand;
++        server_prompt_cache_state stored;
++        bool have = store->find(tokens_new, lcp_best_cur, f_keep_best, f_sim_best, cand);
++        if (!have && store->find_remote(tokens_new, lcp_best_cur, f_keep_best, f_sim_best, cand)) {
++            have = store->fetch(cand);
++        }
++        // the slot's own flag (set when the server has a multimodal projector), not the request's:
++        // a text-only request has has_mtmd = false, and a later image request on this slot would abort
++        if (have && store->read(cand.id, prompt.tokens.has_mtmd, stored)) {
++            SRV_INF(" - using stored prompt %s%s%s: lcp = %d (was %d), f_keep = %.3f, f_sim = %.3f\n",
++                    cand.id.c_str(), cand.peer.empty() ? "" : " from ", cand.peer.c_str(),
++                    cand.lcp, lcp_best_cur, cand.f_keep, cand.f_sim);
++
++            {
++                auto & data = stored.data.main;
++                const size_t size = data.size();
++                const size_t n = llama_state_seq_set_data_ext(ctx_tgt, data.data(), size, id_slot, 0);
++                if (n != size) {
++                    SRV_ERR("failed to restore stored state with size %zu\n", size);
++                    return false;
++                }
++            }
++            {
++                auto & data = stored.data.drft;
++                if (!data.empty()) {
++                    if (ctx_dft == nullptr) {
++                        SRV_ERR("%s", "stored state has draft data but there is no draft context\n");
++                        return false;
++                    }
++                    const size_t size = data.size();
++                    const size_t n = llama_state_seq_set_data_ext(ctx_dft, data.data(), size, id_slot, 0);
++                    if (n != size) {
++                        SRV_WRN("failed to restore stored draft state with size %zu\n", size);
++                        return false;
++                    }
++                }
++            }
++
++            prompt = std::move(stored.prompt);
++
++            return true;
+         }
+     }
+ 
+@@ -1820,12 +1883,26 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+     return true;
+ }
+ 
++void server_prompt_cache::spill_overflow() {
++    if (store && !overflow.empty()) {
++        store->spill(std::move(overflow.front()));
++    }
++    overflow.clear();
++}
++
++void server_prompt_cache::pop_oldest() {
++    if (store) {
++        store->spill(std::move(states.front()));
++    }
++    states.pop_front();
++}
++
+ void server_prompt_cache::update() {
+     if (limit_size > 0) {
+         while (!states.empty() && size() > limit_size) {
+             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+ 
+-            states.pop_front();
++            pop_oldest();
+         }
+     }
+ 
+@@ -1840,7 +1917,7 @@ void server_prompt_cache::update() {
+             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
+                     limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+ 
+-            states.pop_front();
++            pop_oldest();
+         }
+     }
+ 
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 6275ec7..24d1445 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -635,6 +635,8 @@ struct server_prompt_cache_state {
+     }
+ };
+ 
++struct server_kvstore; // on-disk tier (L.A.P.S patch), see server-kvstore.h
++
+ struct server_prompt_cache {
+     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
+         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
+@@ -649,6 +651,12 @@ struct server_prompt_cache {
+     // in tokens, 0 = no limit
+     size_t limit_tokens = 0;
+ 
++    // entries evicted from RAM go here instead of being dropped (nullptr = off)
++    server_kvstore * store = nullptr;
++
++    // an entry too big for the RAM limit, filled by the caller and then written to the store
++    std::list<server_prompt_cache_state> overflow;
++
+     size_t size() const;
+ 
+     size_t n_tokens() const;
+@@ -658,6 +666,13 @@ struct server_prompt_cache {
+     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+ 
+     void update();
++
++    // hand an entry that did not fit in RAM to the store (call after filling the state from alloc)
++    void spill_overflow();
++
++private:
++    // drop the oldest entry, handing it to the on-disk tier if there is one
++    void pop_oldest();
+ };
+ 
+ // used exclusively by router mode
+diff --git a/tools/server/server.cpp b/tools/server/server.cpp
+index aafb1f3..946697a 100644
+--- a/tools/server/server.cpp
++++ b/tools/server/server.cpp
+@@ -4,6 +4,7 @@
+ #include "server-cors-proxy.h"
+ #include "server-stream.h"
+ #include "server-tools.h"
++#include "server-kvstore.h"
+ 
+ #include "arg.h"
+ #include "build-info.h"
+@@ -12,7 +13,9 @@
+ #include "llama.h"
+ #include "log.h"
+ 
++#include <algorithm>
+ #include <atomic>
++#include <cctype>
+ #include <clocale>
+ #include <exception>
+ #include <signal.h>
+@@ -51,6 +54,81 @@ void llama_server_terminate() {
+ 
+ // wrapper function that handles exceptions and logs errors
+ // this is to make sure handler_t never throws exceptions; instead, it returns an error response
++//
++// stored prompts shared with peers (L.A.P.S patch, see server-kvstore.h)
++//
++
++// the store, if the request carries the shared key; otherwise an error response in `err`
++static server_kvstore * kvstore_authorized(const server_http_req & req, server_http_res_ptr & err) {
++    auto * kv = server_kvstore::instance();
++    if (kv == nullptr || !kv->serving()) {
++        err = std::make_unique<server_http_res>();
++        err->status = 404;
++        err->data   = R"({"error":"sharing of stored prompts is off"})";
++        return nullptr;
++    }
++    std::string key;
++    for (const auto & [name, value] : req.headers) {
++        std::string lower = name;
++        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return (char) std::tolower(c); });
++        if (lower == "x-kvstore-key") {
++            key = value;
++        }
++    }
++    if (!kv->check_key(key)) {
++        err = std::make_unique<server_http_res>();
++        err->status = 403;
++        err->data   = R"({"error":"wrong or missing key"})";
++        return nullptr;
++    }
++    return kv;
++}
++
++static server_http_res_ptr kvstore_get_index(const server_http_req & req) {
++    server_http_res_ptr err;
++    auto * kv = kvstore_authorized(req, err);
++    if (kv == nullptr) {
++        return err;
++    }
++    auto res = std::make_unique<server_http_res>();
++    res->data = kv->index_json();
++    return res;
++}
++
++static server_http_res_ptr kvstore_get_blob(const server_http_req & req) {
++    server_http_res_ptr err;
++    auto * kv = kvstore_authorized(req, err);
++    if (kv == nullptr) {
++        return err;
++    }
++    std::string path;
++    size_t size = 0;
++    if (!kv->blob_path(req.get_param("id"), path, size)) {
++        auto res = std::make_unique<server_http_res>();
++        res->status = 404;
++        res->data   = R"({"error":"no such stored prompt"})";
++        return res;
++    }
++    std::shared_ptr<FILE> f(fopen(path.c_str(), "rb"), [](FILE * p) { if (p) { fclose(p); } });
++    if (!f) {
++        auto res = std::make_unique<server_http_res>();
++        res->status = 404;
++        res->data   = R"({"error":"stored prompt is gone"})";
++        return res;
++    }
++    auto res = std::make_unique<server_http_res>();
++    res->content_type = "application/octet-stream";
++    res->headers["X-Kvstore-Bytes"] = std::to_string(size);
++    res->next = [f](std::string & chunk) -> bool {
++        const size_t want = 4u << 20;
++        chunk.resize(want);
++        const size_t n = fread(chunk.data(), 1, want, f.get());
++        chunk.resize(n);
++        return n == want;
++    };
++    return res;
++}
++
+ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t func) {
+     return [func = std::move(func)](const server_http_req & req) -> server_http_res_ptr {
+         std::string message;
+@@ -231,6 +309,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
+     }
+ 
+     ctx_http.get ("/health",                   ex_wrapper(routes.get_health)); // public endpoint (no API key check)
++    ctx_http.get ("/kvstore/index",            ex_wrapper(kvstore_get_index)); // needs the peer key
++    ctx_http.get ("/kvstore/blob/:id",         ex_wrapper(kvstore_get_blob));  // needs the peer key
+     ctx_http.get ("/v1/health",                ex_wrapper(routes.get_health)); // public endpoint (no API key check)
+     ctx_http.get ("/metrics",                  ex_wrapper(routes.get_metrics));
+     ctx_http.get ("/props",                    ex_wrapper(routes.get_props));

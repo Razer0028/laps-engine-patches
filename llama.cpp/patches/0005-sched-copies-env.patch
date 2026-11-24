@@ -1,0 +1,20 @@
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index f6fb917..03d0e8e 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1802,6 +1802,15 @@ ggml_backend_sched_t ggml_backend_sched_new(
+ 
+     sched->n_backends = n_backends;
+     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
++    // L.A.P.S patch 0005: GGML_SCHED_COPIES=<2..GGML_SCHED_MAX_COPIES> で流れ作業の入力の控えの数を減らす。
++    // 控えは分割ごとの入力 × 数だけ計算用の場所を取る（層ごとに GPU を行き来する置き方では分割が 80 を超え、4 つだと 8GB の GPU に入らない）。
++    // 待ち合わせの印は控えの数だけ作られるので、2 でも GPU どうしの待ち合わせは印のまま（親が待たない）。
++    if (parallel) {
++        const char * env = getenv("GGML_SCHED_COPIES");
++        if (env != nullptr && atoi(env) >= 2) {
++            sched->n_copies = std::min(atoi(env), GGML_SCHED_MAX_COPIES);
++        }
++    }
+ 
+     // initialize hash table
+     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)

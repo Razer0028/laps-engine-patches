@@ -1,0 +1,1163 @@
+diff --git a/ggml/src/ggml-rpc/ggml-rpc.cpp b/ggml/src/ggml-rpc/ggml-rpc.cpp
+index 17c53a5..e35d369 100644
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -7,6 +7,9 @@
+ #include <array>
+ #include <cinttypes>
+ #include <optional>
++#include <map>
++#include <tuple>
++#include <random>
+ #include <string>
+ #include <vector>
+ #include <memory>
+@@ -52,6 +55,22 @@ struct rpc_tensor {
+ 
+ static_assert(sizeof(rpc_tensor) % 8 == 0, "rpc_tensor size must be multiple of 8");
+ 
++// ★計算の手順のノードごとの「使われる数」を rpc_tensor の余り（padding）に入れて送る。
++// 子は手順を受け取り直すと、ノードの探し表（visited_hash_set / use_counts）が空になり、CUDA の演算の融合
++// （ggml_node_has_n_uses）が全部止まる。親の数をそのまま渡せば、手元で動かすときと同じ融合になる。
++// 印の無い値（0）は「数が分からない」＝古い親。そのときは今までどおり表を空のままにする（融合しない＝安全側）。
++static constexpr uint32_t RPC_USE_COUNT_MARK = 0x80000000u;
++
++// ★入力の控え: 毎トークン同じ中身の入力（KV の量子化の回転の行列 attn_inp_k_rot 256KB など）を送り直さない。
++// 親は前に送った中身と比べ、同じなら 2 回目に子の控えへ残させ（STORE）、3 回目からは控えの番号だけを送る（SLOT）。
++// 子は毎回、控えの中身を GPU へ全部書く＝GPU の中身が残っていることには頼らない。
++// 子が対応しているかは HELLO の返事の余り（padding）の印で分かる（古い子は 0 ＝使わない）。
++static constexpr uint8_t  RPC_FEATURE_SET_SLOTS = 0x01;
++static constexpr uint32_t RPC_SET_SLOTS         = 64;
++static constexpr size_t   RPC_SET_SLOT_MIN      = 4096;
++static constexpr size_t   RPC_SET_SLOT_MAX      = 8u << 20;
++static constexpr size_t   RPC_SET_REUSE_BYTES   = 64u << 20;   // 親が覚えておく「前の中身」の合計の上限
++
+ // RPC commands
+ enum rpc_cmd {
+     RPC_CMD_ALLOC_BUFFER = 0,
+@@ -72,6 +91,10 @@ enum rpc_cmd {
+     RPC_CMD_DEVICE_COUNT,
+     RPC_CMD_GRAPH_RECOMPUTE,
+     RPC_CMD_MEMSET_TENSOR,
++    RPC_CMD_AUTH_CHALLENGE,   // ★鍵による認証（GGML_RPC_KEY_FILE）: 子が乱数を返す
++    RPC_CMD_AUTH,             // ★親が乱数と HMAC を送り、子が確かめて自分の HMAC を返す
++    RPC_CMD_SET_TENSOR_STORE, // ★SET_TENSOR と同じに書き、中身を子の控え（番号つき）にも残す
++    RPC_CMD_SET_TENSOR_SLOT,  // ★子の控えの中身を書く（毎トークン同じ入力を送り直さない）
+     RPC_CMD_COUNT,
+ };
+ 
+@@ -198,6 +221,27 @@ struct rpc_msg_graph_recompute_req {
+     uint32_t device;
+ };
+ 
++struct rpc_msg_auth_challenge_rsp {
++    uint8_t nonce[32];
++};
++
++struct rpc_msg_auth_req {
++    uint8_t nonce[32];
++    uint8_t mac[32];
++};
++
++struct rpc_msg_auth_rsp {
++    uint8_t ok;
++    uint8_t mac[32];
++};
++
++struct rpc_msg_set_tensor_slot_req {
++    uint32_t   slot;
++    rpc_tensor tensor;
++    uint64_t   offset;
++    uint64_t   size;
++};
++
+ #pragma pack(pop)
+ 
+ // RPC data structures
+@@ -221,8 +265,27 @@ struct ggml_backend_rpc_buffer_type_context {
+     std::string name;
+     size_t      alignment;
+     size_t      max_size;
++    // ★子に問い合わせた割り当ての大きさを覚えておく（形・型・演算が同じなら答えも同じ）。
++    // 覚えないと、手順を割り当て直すたびに FLASH_ATTN_EXT と MUL_MAT_ID の数だけ往復が増える（網の上では 1 回 0.2ms 前後）
++    std::mutex                              alloc_size_mutex;
++    std::unordered_map<std::string, size_t> alloc_size_cache;
+ };
+ 
++// 割り当ての大きさを決める値だけを鍵にする（住所・名前・つながりの番号は入れない）
++static void rpc_alloc_size_key_add(std::string & key, const ggml_tensor * t) {
++    if (t == nullptr) {
++        key.push_back('\0');
++        return;
++    }
++    key.push_back('\1');
++    key.append((const char *) &t->type, sizeof(t->type));
++    key.append((const char *) t->ne, sizeof(t->ne));
++    key.append((const char *) t->nb, sizeof(t->nb));
++    key.append((const char *) &t->op, sizeof(t->op));
++    key.append((const char *) t->op_params, sizeof(t->op_params));
++    key.push_back(t->view_src != nullptr ? '\1' : '\0');
++}
++
+ struct ggml_backend_rpc_context {
+     std::string endpoint;
+     uint32_t    device;
+@@ -295,9 +358,276 @@ static bool parse_endpoint(const std::string & endpoint, std::string & host, int
+     return true;
+ }
+ 
++// ★鍵による認証（GGML_RPC_KEY_FILE=<鍵のファイル>）。
++// 子は鍵があれば、HELLO の後に AUTH_CHALLENGE → AUTH を通らない相手の命令を受け付けず、接続を切る。
++// 親は鍵があれば、HELLO の後に必ず認証し、子が鍵を持たない・子の答えが合わないときは繋がない（どちら向きも鍵が無ければ通らない）。
++// 鍵そのものは網に流さない: 子の乱数と親の乱数を HMAC-SHA256 で結んだ値だけを交わす。中身の暗号化はしない（盗み見は防がない）。
++// --- sha256 begin
++struct rpc_sha256 {
++    uint32_t h[8] = { 0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19 };
++    uint64_t total = 0;
++    uint8_t  buf[64];
++    size_t   n = 0;
++
++    static uint32_t ror(uint32_t x, int r) { return (x >> r) | (x << (32 - r)); }
++
++    void block(const uint8_t * p) {
++        static const uint32_t k[64] = {
++            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
++            0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
++            0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
++            0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++            0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
++            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
++        };
++        uint32_t w[64];
++        for (int i = 0; i < 16; i++) {
++            w[i] = (uint32_t) p[4*i] << 24 | (uint32_t) p[4*i + 1] << 16 | (uint32_t) p[4*i + 2] << 8 | (uint32_t) p[4*i + 3];
++        }
++        for (int i = 16; i < 64; i++) {
++            const uint32_t s0 = ror(w[i - 15], 7) ^ ror(w[i - 15], 18) ^ (w[i - 15] >> 3);
++            const uint32_t s1 = ror(w[i - 2], 17) ^ ror(w[i - 2], 19) ^ (w[i - 2] >> 10);
++            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
++        }
++        uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
++        for (int i = 0; i < 64; i++) {
++            const uint32_t t1 = hh + (ror(e, 6) ^ ror(e, 11) ^ ror(e, 25)) + ((e & f) ^ (~e & g)) + k[i] + w[i];
++            const uint32_t t2 = (ror(a, 2) ^ ror(a, 13) ^ ror(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
++            hh = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
++        }
++        h[0] += a; h[1] += b; h[2] += c; h[3] += d; h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
++    }
++
++    void update(const void * data, size_t len) {
++        const uint8_t * p = (const uint8_t *) data;
++        total += len;
++        while (len > 0) {
++            const size_t take = std::min(len, sizeof(buf) - n);
++            memcpy(buf + n, p, take);
++            n += take; p += take; len -= take;
++            if (n == sizeof(buf)) {
++                block(buf);
++                n = 0;
++            }
++        }
++    }
++
++    void final(uint8_t out[32]) {
++        const uint64_t bits = total * 8;
++        const uint8_t pad = 0x80, zero = 0;
++        update(&pad, 1);
++        while (n != 56) {
++            update(&zero, 1);
++        }
++        uint8_t len_be[8];
++        for (int i = 0; i < 8; i++) {
++            len_be[i] = (uint8_t) (bits >> (56 - 8*i));
++        }
++        update(len_be, 8);
++        for (int i = 0; i < 8; i++) {
++            out[4*i] = (uint8_t) (h[i] >> 24); out[4*i + 1] = (uint8_t) (h[i] >> 16);
++            out[4*i + 2] = (uint8_t) (h[i] >> 8); out[4*i + 3] = (uint8_t) h[i];
++        }
++    }
++};
++
++static void rpc_hmac_sha256(const std::string & key, const std::vector<const std::string *> & parts, uint8_t out[32]) {
++    uint8_t k[64] = {};
++    if (key.size() > sizeof(k)) {
++        rpc_sha256 kh;
++        kh.update(key.data(), key.size());
++        kh.final(k);
++    } else {
++        memcpy(k, key.data(), key.size());
++    }
++    uint8_t ipad[64], opad[64];
++    for (int i = 0; i < 64; i++) {
++        ipad[i] = k[i] ^ 0x36;
++        opad[i] = k[i] ^ 0x5c;
++    }
++    uint8_t inner[32];
++    rpc_sha256 ih;
++    ih.update(ipad, sizeof(ipad));
++    for (auto * part : parts) {
++        ih.update(part->data(), part->size());
++    }
++    ih.final(inner);
++    rpc_sha256 oh;
++    oh.update(opad, sizeof(opad));
++    oh.update(inner, sizeof(inner));
++    oh.final(out);
++}
++// --- sha256 end
++
++static void rpc_auth_mac(const std::string & key, const char * label, const uint8_t nonce_s[32], const uint8_t nonce_c[32], uint8_t out[32]) {
++    const std::string l(label), ns((const char *) nonce_s, 32), nc((const char *) nonce_c, 32);
++    rpc_hmac_sha256(key, { &l, &ns, &nc }, out);
++}
++
++static bool rpc_mac_equal(const uint8_t * a, const uint8_t * b) {
++    uint8_t diff = 0;
++    for (int i = 0; i < 32; i++) {
++        diff |= a[i] ^ b[i];
++    }
++    return diff == 0;
++}
++
++static void rpc_random_bytes(uint8_t * out, size_t n) {
++    std::random_device rd;
++    for (size_t i = 0; i < n; i += 4) {
++        const uint32_t v = rd();
++        memcpy(out + i, &v, std::min<size_t>(4, n - i));
++    }
++}
++
++// 鍵を読む。GGML_RPC_KEY_FILE が無ければ鍵なし（true・key は空）。あるのに読めない・短いときは false（繋がない・立ち上げない）。
++static bool rpc_load_key(std::string & key) {
++    key.clear();
++    const char * path = std::getenv("GGML_RPC_KEY_FILE");
++    if (path == nullptr || *path == '\0') {
++        return true;
++    }
++    std::ifstream f(path, std::ios::binary);
++    if (!f) {
++        GGML_LOG_ERROR("RPC: cannot read the key file %s\n", path);
++        return false;
++    }
++    key.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
++    while (!key.empty() && (key.back() == '\n' || key.back() == '\r' || key.back() == ' ' || key.back() == '\t')) {
++        key.pop_back();
++    }
++    if (key.size() < 16) {
++        GGML_LOG_ERROR("RPC: the key in %s is shorter than 16 bytes\n", path);
++        key.clear();
++        return false;
++    }
++    return true;
++}
++
++// ★時間の内訳（GGML_RPC_PROF=<N> のとき）。命令ごとの回数・時間・送受信の量を数え、計算の命令 N 回（既定 64）ごとに 1 行出す。
++// 親（client）は命令を送ってから返事を受け取るまで、子（server）は命令を受けてから片づけ終わるまでを数える。
++// 子は「次の命令を待っていた時間」も数える（親の GPU が計算している間など）。
++static const char * rpc_cmd_name(uint8_t cmd) {
++    static const char * names[] = {
++        "ALLOC_BUFFER", "GET_ALIGNMENT", "GET_MAX_SIZE", "BUFFER_GET_BASE", "FREE_BUFFER", "BUFFER_CLEAR",
++        "SET_TENSOR", "SET_TENSOR_HASH", "GET_TENSOR", "COPY_TENSOR", "GRAPH_COMPUTE", "GET_DEVICE_MEMORY",
++        "INIT_TENSOR", "GET_ALLOC_SIZE", "HELLO", "DEVICE_COUNT", "GRAPH_RECOMPUTE", "MEMSET_TENSOR",
++        "AUTH_CHALLENGE", "AUTH", "SET_TENSOR_STORE", "SET_TENSOR_SLOT",
++    };
++    static_assert(sizeof(names) / sizeof(names[0]) == RPC_CMD_COUNT, "rpc_cmd_name must list every command");
++    return cmd < RPC_CMD_COUNT ? names[cmd] : "?";
++}
++
++struct rpc_prof {
++    const char * side;
++    bool         on;
++    uint64_t     every;
++    std::mutex   mtx;
++    uint64_t     n[RPC_CMD_COUNT]   = {};
++    uint64_t     us[RPC_CMD_COUNT]  = {};
++    uint64_t     out[RPC_CMD_COUNT] = {};
++    uint64_t     in[RPC_CMD_COUNT]  = {};
++    uint64_t     idle_us  = 0;
++    uint64_t     computes = 0;
++    int64_t      t_start  = 0;
++    std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> set_by_name; // 子: SET_TENSOR の名前ごとの回数と量
++
++    explicit rpc_prof(const char * side) : side(side) {
++        const char * e = std::getenv("GGML_RPC_PROF");
++        on    = e != nullptr;
++        every = (e && std::atoi(e) > 1) ? (uint64_t) std::atoi(e) : 64;
++    }
++
++    void add(uint8_t cmd, int64_t t_us, uint64_t bytes_out, uint64_t bytes_in) {
++        if (!on || cmd >= RPC_CMD_COUNT) {
++            return;
++        }
++        std::lock_guard<std::mutex> lock(mtx);
++        if (t_start == 0) {
++            t_start = ggml_time_us() - t_us;
++        }
++        n[cmd]++;
++        us[cmd]  += t_us;
++        out[cmd] += bytes_out;
++        in[cmd]  += bytes_in;
++        if (cmd == RPC_CMD_GRAPH_COMPUTE || cmd == RPC_CMD_GRAPH_RECOMPUTE) {
++            if (++computes >= every) {
++                dump_locked();
++            }
++        }
++    }
++
++    void add_set_name(const char * name, uint64_t bytes) {
++        if (!on) {
++            return;
++        }
++        std::lock_guard<std::mutex> lock(mtx);
++        auto & e = set_by_name[name];
++        e.first++;
++        e.second += bytes;
++    }
++
++    void add_idle(int64_t t_us) {
++        if (!on) {
++            return;
++        }
++        std::lock_guard<std::mutex> lock(mtx);
++        idle_us += t_us;
++    }
++
++    void dump_locked() {
++        if (computes == 0) {
++            return;
++        }
++        const double wall_ms = (ggml_time_us() - t_start) / 1000.0;
++        uint64_t busy = 0;
++        std::string s;
++        char buf[256];
++        for (int c = 0; c < RPC_CMD_COUNT; c++) {
++            if (n[c] == 0) {
++                continue;
++            }
++            busy += us[c];
++            snprintf(buf, sizeof(buf), " %s n=%.1f t=%.3fms out=%.1fKB in=%.1fKB;", rpc_cmd_name(c),
++                     (double) n[c] / computes, us[c] / 1000.0 / computes, out[c] / 1024.0 / computes, in[c] / 1024.0 / computes);
++            s += buf;
++        }
++        snprintf(buf, sizeof(buf), " | busy %.3fms idle %.3fms wall %.3fms", busy / 1000.0 / computes,
++                 idle_us / 1000.0 / computes, wall_ms / computes);
++        s += buf;
++        // llama-bench は ggml のログを捨てるので、標準エラーへ直に書く
++        if (!set_by_name.empty()) {
++            std::vector<std::pair<std::string, std::pair<uint64_t, uint64_t>>> v(set_by_name.begin(), set_by_name.end());
++            std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.second.second > b.second.second; });
++            s += " | set:";
++            for (size_t i = 0; i < v.size() && i < 8; i++) {
++                snprintf(buf, sizeof(buf), " %s n=%.1f %.1fKB;", v[i].first.c_str(), (double) v[i].second.first / computes,
++                         v[i].second.second / 1024.0 / computes);
++                s += buf;
++            }
++            set_by_name.clear();
++        }
++        fprintf(stderr, "[rpc-prof %s] per compute (x%" PRIu64 "):%s\n", side, computes, s.c_str());
++        memset(n, 0, sizeof(n));
++        memset(us, 0, sizeof(us));
++        memset(out, 0, sizeof(out));
++        memset(in, 0, sizeof(in));
++        idle_us  = 0;
++        computes = 0;
++        t_start  = 0;
++    }
++};
++
++static rpc_prof & rpc_client_prof() {
++    static rpc_prof prof("client");
++    return prof;
++}
++
+ // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
+ // No response
+-static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
++static bool send_rpc_cmd_raw(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
+     uint8_t cmd_byte = cmd;
+     if (!sock->send_data(&cmd_byte, sizeof(cmd_byte))) {
+         return false;
+@@ -311,10 +641,20 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+     return true;
+ }
+ 
++static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size) {
++    const int64_t t0 = rpc_client_prof().on ? ggml_time_us() : 0;
++    const bool ok = send_rpc_cmd_raw(sock, cmd, input, input_size);
++    if (rpc_client_prof().on) {
++        rpc_client_prof().add(cmd, ggml_time_us() - t0, input_size, 0);
++    }
++    return ok;
++}
++
+ // RPC request : | rpc_cmd (1 byte) | request_size (8 bytes) | request_data (request_size bytes) |
+ // RPC response: | response_size (8 bytes) | response_data (response_size bytes) |
+ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input, size_t input_size, void * output, size_t output_size) {
+-    if (!send_rpc_cmd(sock, cmd, input, input_size)) {
++    const int64_t t0 = rpc_client_prof().on ? ggml_time_us() : 0;
++    if (!send_rpc_cmd_raw(sock, cmd, input, input_size)) {
+         return false;
+     }
+     uint64_t out_size;
+@@ -327,11 +667,46 @@ static bool send_rpc_cmd(socket_ptr sock, enum rpc_cmd cmd, const void * input,
+     if (!sock->recv_data(output, output_size)) {
+         return false;
+     }
++    if (rpc_client_prof().on) {
++        rpc_client_prof().add(cmd, ggml_time_us() - t0, input_size, output_size);
++    }
+     return true;
+ }
+ 
+ // RPC client-side implementation
+ 
++struct rpc_set_reuse {
++    struct region {
++        std::vector<uint8_t> last;
++        int                  slot = -1;
++    };
++    std::mutex mtx;
++    std::map<std::tuple<uint64_t, uint64_t, uint64_t, uint64_t>, region> regions; // (子のバッファ, 住所, offset, size)
++    size_t   bytes = 0;
++    region * owner[RPC_SET_SLOTS] = {};
++    uint64_t used[RPC_SET_SLOTS]  = {};
++    uint64_t tick = 0;
++};
++
++static std::mutex rpc_set_reuse_mutex;
++static std::unordered_map<const socket_t *, std::shared_ptr<rpc_set_reuse>> rpc_set_reuse_map;
++
++// 接続ごとに作り直す（同じ住所に新しい接続ができても、前の接続の控えを使わない）
++static void rpc_set_reuse_reset(const socket_t * sock, bool supported) {
++    std::lock_guard<std::mutex> lock(rpc_set_reuse_mutex);
++    rpc_set_reuse_map.erase(sock);
++    const char * off = std::getenv("GGML_RPC_NO_SET_SLOTS");   // 1 で使わない（空・0 は使う）
++    if (supported && (off == nullptr || *off == '\0' || strcmp(off, "0") == 0)) {
++        rpc_set_reuse_map[sock] = std::make_shared<rpc_set_reuse>();
++    }
++}
++
++static std::shared_ptr<rpc_set_reuse> rpc_set_reuse_get(const socket_t * sock) {
++    std::lock_guard<std::mutex> lock(rpc_set_reuse_mutex);
++    auto it = rpc_set_reuse_map.find(sock);
++    return it == rpc_set_reuse_map.end() ? nullptr : it->second;
++}
++
+ // Performs HELLO handshake with transport auto-negotiation.
+ // Advertises local capabilities via conn_caps; if the server responds with
+ // matching capabilities, the socket is upgraded transparently.
+@@ -351,6 +726,34 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
+     }
+ 
+     sock->update_caps(response.conn_caps);
++    rpc_set_reuse_reset(sock.get(), (response.padding & RPC_FEATURE_SET_SLOTS) != 0);
++
++    std::string key;
++    if (!rpc_load_key(key)) {
++        return false;
++    }
++    if (key.empty()) {
++        return true;
++    }
++    rpc_msg_auth_challenge_rsp challenge = {};
++    if (!send_rpc_cmd(sock, RPC_CMD_AUTH_CHALLENGE, nullptr, 0, &challenge, sizeof(challenge))) {
++        GGML_LOG_ERROR("RPC: the server did not offer key authentication (it has no key, or is too old)\n");
++        return false;
++    }
++    rpc_msg_auth_req auth = {};
++    rpc_random_bytes(auth.nonce, sizeof(auth.nonce));
++    rpc_auth_mac(key, "bw-rpc-auth-client", challenge.nonce, auth.nonce, auth.mac);
++    rpc_msg_auth_rsp auth_rsp = {};
++    if (!send_rpc_cmd(sock, RPC_CMD_AUTH, &auth, sizeof(auth), &auth_rsp, sizeof(auth_rsp)) || !auth_rsp.ok) {
++        GGML_LOG_ERROR("RPC: the server rejected the key\n");
++        return false;
++    }
++    uint8_t expect[32];
++    rpc_auth_mac(key, "bw-rpc-auth-server", challenge.nonce, auth.nonce, expect);
++    if (!rpc_mac_equal(expect, auth_rsp.mac)) {
++        GGML_LOG_ERROR("RPC: the server does not hold the same key\n");
++        return false;
++    }
+     return true;
+ }
+ 
+@@ -483,9 +886,84 @@ static void ggml_backend_rpc_buffer_memset_tensor(
+     RPC_STATUS_ASSERT(status);
+ }
+ 
++// 前に送った中身と同じなら控え（STORE / SLOT）で送って true。違えば前の中身を覚え直して false（呼び元が普通に送る）。
++static bool rpc_set_tensor_reuse(const std::shared_ptr<socket_t> & sock, rpc_set_reuse & reuse, const rpc_tensor & tensor,
++                                 const void * data, size_t offset, size_t size) {
++    std::lock_guard<std::mutex> lock(reuse.mtx);
++    const auto key = std::make_tuple(tensor.buffer, tensor.data, (uint64_t) offset, (uint64_t) size);
++    auto it = reuse.regions.find(key);
++    if (it == reuse.regions.end()) {
++        if (reuse.bytes + size > RPC_SET_REUSE_BYTES) {
++            // 覚えすぎ: 全部忘れて覚え直す（子の控えは上書きされるだけなので消さなくてよい）
++            reuse.regions.clear();
++            reuse.bytes = 0;
++            std::fill(std::begin(reuse.owner), std::end(reuse.owner), nullptr);
++        }
++        it = reuse.regions.emplace(key, rpc_set_reuse::region{}).first;
++    }
++    auto & r = it->second;
++    reuse.tick++;
++    const bool same = r.last.size() == size && memcmp(r.last.data(), data, size) == 0;
++    if (same && r.slot >= 0) {
++        rpc_msg_set_tensor_slot_req req = {};
++        req.slot   = (uint32_t) r.slot;
++        req.tensor = tensor;
++        req.offset = offset;
++        req.size   = size;
++        reuse.used[r.slot] = reuse.tick;
++        RPC_STATUS_ASSERT(send_rpc_cmd(sock, RPC_CMD_SET_TENSOR_SLOT, &req, sizeof(req)));
++        return true;
++    }
++    if (same) {
++        // 2 回続けて同じ中身: 空いている控え（無ければいちばん古く使った控え）に残させる
++        uint32_t slot = 0;
++        for (uint32_t i = 0; i < RPC_SET_SLOTS; i++) {
++            if (reuse.owner[i] == nullptr) {
++                slot = i;
++                break;
++            }
++            if (reuse.used[i] < reuse.used[slot]) {
++                slot = i;
++            }
++        }
++        if (reuse.owner[slot] != nullptr) {
++            reuse.owner[slot]->slot = -1;
++        }
++        reuse.owner[slot] = &r;
++        reuse.used[slot]  = reuse.tick;
++        r.slot = (int) slot;
++        // | slot (4 bytes) | rpc_tensor | offset (8 bytes) | data (size bytes) |
++        std::vector<uint8_t> input(sizeof(uint32_t) + sizeof(rpc_tensor) + sizeof(uint64_t) + size);
++        uint8_t * p = input.data();
++        memcpy(p, &slot, sizeof(slot));                 p += sizeof(slot);
++        memcpy(p, &tensor, sizeof(rpc_tensor));         p += sizeof(rpc_tensor);
++        uint64_t off = offset;
++        memcpy(p, &off, sizeof(off));                   p += sizeof(off);
++        memcpy(p, data, size);
++        RPC_STATUS_ASSERT(send_rpc_cmd(sock, RPC_CMD_SET_TENSOR_STORE, input.data(), input.size()));
++        return true;
++    }
++    if (r.slot >= 0) {
++        reuse.owner[r.slot] = nullptr;
++        r.slot = -1;
++    }
++    reuse.bytes = reuse.bytes - r.last.size() + size;
++    r.last.assign((const uint8_t *) data, (const uint8_t *) data + size);
++    return false;
++}
++
+ static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
+     rpc_tensor rpc_tensor = serialize_tensor(tensor);
++    // 計算用のバッファ（手順の入力が置かれる所）だけ。重みの読み込みは今までどおり
++    if (size >= RPC_SET_SLOT_MIN && size <= RPC_SET_SLOT_MAX &&
++        ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++        if (auto reuse = rpc_set_reuse_get(ctx->sock.get())) {
++            if (rpc_set_tensor_reuse(ctx->sock, *reuse, rpc_tensor, data, offset, size)) {
++                return;
++            }
++        }
++    }
+     if (size > HASH_THRESHOLD) {
+         rpc_msg_set_tensor_hash_req request;
+         request.tensor = rpc_tensor;
+@@ -638,11 +1116,25 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
+             request.srcs[i] = serialize_tensor(tensor->src[i]);
+         }
+ 
+-        // TODO: cache the alloc responses to avoid extra RPC calls?
++        std::string key;
++        rpc_alloc_size_key_add(key, tensor);
++        for (int i = 0; i < GGML_MAX_SRC; i++) {
++            rpc_alloc_size_key_add(key, tensor->src[i]);
++        }
++        {
++            std::lock_guard<std::mutex> lock(buft_ctx->alloc_size_mutex);
++            auto it = buft_ctx->alloc_size_cache.find(key);
++            if (it != buft_ctx->alloc_size_cache.end()) {
++                return it->second;
++            }
++        }
++
+         rpc_msg_get_alloc_size_rsp response;
+         bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
+         RPC_STATUS_ASSERT(status);
+ 
++        std::lock_guard<std::mutex> lock(buft_ctx->alloc_size_mutex);
++        buft_ctx->alloc_size_cache.emplace(std::move(key), response.alloc_size);
+         return response.alloc_size;
+     }
+ 
+@@ -699,6 +1191,21 @@ static void serialize_graph(uint32_t device, const ggml_cgraph * cgraph, std::ve
+     }
+     // serialization format:
+     // | device (4 bytes) | n_nodes (4 bytes) | nodes (n_nodes * sizeof(uint64_t) | n_tensors (4 bytes) | tensors (n_tensors * sizeof(rpc_tensor)) |
++    // ノードの「使われる数」（分割の手順は元の手順の一部を見ているので、ほかの分割で使われる分も入っている）
++    if (cgraph->use_counts != nullptr && cgraph->visited_hash_set.size > 0) {
++        std::unordered_map<uint64_t, uint32_t> node_uses;
++        node_uses.reserve(n_nodes);
++        for (uint32_t i = 0; i < n_nodes; i++) {
++            const int32_t uses = ggml_node_get_use_count(cgraph, i);
++            node_uses[reinterpret_cast<uint64_t>(cgraph->nodes[i])] = RPC_USE_COUNT_MARK | (uint32_t) std::max(uses, 0);
++        }
++        for (auto & t : tensors) {
++            auto it = node_uses.find(t.id);
++            if (it != node_uses.end()) {
++                memcpy(t.padding, &it->second, sizeof(uint32_t));
++            }
++        }
++    }
+     uint32_t n_tensors = tensors.size();
+     int output_size = 2*sizeof(uint32_t) + n_nodes * sizeof(uint64_t) + sizeof(uint32_t) + n_tensors * sizeof(rpc_tensor);
+     output.resize(output_size, 0);
+@@ -741,6 +1248,16 @@ static enum ggml_status ggml_backend_rpc_graph_compute(ggml_backend_t backend, g
+     return GGML_STATUS_SUCCESS;
+ }
+ 
++static void ggml_backend_rpc_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
++    GGML_UNUSED(backend);
++    GGML_UNUSED(event);
++}
++
++static void ggml_backend_rpc_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
++    GGML_UNUSED(backend);
++    GGML_UNUSED(event);
++}
++
+ static ggml_backend_i ggml_backend_rpc_interface = {
+     /* .get_name                = */ ggml_backend_rpc_name,
+     /* .free                    = */ ggml_backend_rpc_free,
+@@ -755,8 +1272,8 @@ static ggml_backend_i ggml_backend_rpc_interface = {
+     /* .graph_plan_update       = */ NULL,
+     /* .graph_plan_compute      = */ NULL,
+     /* .graph_compute           = */ ggml_backend_rpc_graph_compute,
+-    /* .event_record            = */ NULL,
+-    /* .event_wait              = */ NULL,
++    /* .event_record            = */ ggml_backend_rpc_event_record,
++    /* .event_wait              = */ ggml_backend_rpc_event_wait,
+     /* .graph_optimize          = */ NULL,
+ };
+ 
+@@ -854,6 +1371,8 @@ public:
+     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
+     bool memset_tensor(const rpc_msg_memset_tensor_req & request);
+     bool set_tensor(const std::vector<uint8_t> & input);
++    bool set_tensor_store(const std::vector<uint8_t> & input);
++    bool set_tensor_slot(const rpc_msg_set_tensor_slot_req & request);
+     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
+     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
+     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
+@@ -869,6 +1388,7 @@ public:
+     };
+ 
+ private:
++    bool set_tensor_data(const rpc_tensor * in_tensor, uint64_t offset, const void * data, size_t size);
+     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
+     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
+     ggml_tensor * create_node(uint64_t id,
+@@ -882,12 +1402,15 @@ private:
+     std::unordered_set<ggml_backend_buffer_t> buffers;
+     // store the last computed graph for each backend
+     std::vector<stored_graph> stored_graphs;
++    // ★入力の控え（SET_TENSOR_STORE で残し、SET_TENSOR_SLOT で書く）
++    std::vector<std::vector<uint8_t>> set_slots;
+ };
+ 
+ void rpc_server::hello(rpc_msg_hello_rsp & response) {
+     response.major = RPC_PROTO_MAJOR_VERSION;
+     response.minor = RPC_PROTO_MINOR_VERSION;
+     response.patch = RPC_PROTO_PATCH_VERSION;
++    response.padding = RPC_FEATURE_SET_SLOTS;
+     LOG_DBG("[%s] version: %d.%d.%d\n", __func__, response.major, response.minor, response.patch);
+ }
+ 
+@@ -1116,6 +1639,43 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
+     uint64_t offset;
+     memcpy(&offset, input.data() + sizeof(rpc_tensor), sizeof(offset));
+     const size_t size = input.size() - sizeof(rpc_tensor) - sizeof(offset);
++    return set_tensor_data(in_tensor, offset, input.data() + sizeof(rpc_tensor) + sizeof(offset), size);
++}
++
++bool rpc_server::set_tensor_store(const std::vector<uint8_t> & input) {
++    // | slot (4 bytes) | rpc_tensor | offset (8 bytes) | data (size bytes) |
++    if (input.size() < sizeof(uint32_t) + sizeof(rpc_tensor) + sizeof(uint64_t)) {
++        return false;
++    }
++    uint32_t slot;
++    memcpy(&slot, input.data(), sizeof(slot));
++    rpc_tensor in_tensor;
++    memcpy(&in_tensor, input.data() + sizeof(slot), sizeof(in_tensor));
++    uint64_t offset;
++    memcpy(&offset, input.data() + sizeof(slot) + sizeof(rpc_tensor), sizeof(offset));
++    const uint8_t * data = input.data() + sizeof(slot) + sizeof(rpc_tensor) + sizeof(offset);
++    const size_t size = input.size() - sizeof(slot) - sizeof(rpc_tensor) - sizeof(offset);
++    if (slot >= RPC_SET_SLOTS || size > RPC_SET_SLOT_MAX) {
++        GGML_LOG_ERROR("[%s] bad slot %u or size %zu\n", __func__, slot, size);
++        return false;
++    }
++    if (!set_tensor_data(&in_tensor, offset, data, size)) {
++        return false;
++    }
++    set_slots.resize(RPC_SET_SLOTS);
++    set_slots[slot].assign(data, data + size);
++    return true;
++}
++
++bool rpc_server::set_tensor_slot(const rpc_msg_set_tensor_slot_req & request) {
++    if (request.slot >= set_slots.size() || set_slots[request.slot].empty() || set_slots[request.slot].size() != request.size) {
++        GGML_LOG_ERROR("[%s] slot %u does not hold %" PRIu64 " bytes\n", __func__, request.slot, request.size);
++        return false;
++    }
++    return set_tensor_data(&request.tensor, request.offset, set_slots[request.slot].data(), request.size);
++}
++
++bool rpc_server::set_tensor_data(const rpc_tensor * in_tensor, uint64_t offset, const void * data, size_t size) {
+ 
+     struct ggml_init_params params {
+         /*.mem_size   =*/ ggml_tensor_overhead(),
+@@ -1144,7 +1704,6 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
+         }
+     }
+ 
+-    const void * data = input.data() + sizeof(rpc_tensor) + sizeof(offset);
+     if (cache_dir && size > HASH_THRESHOLD) {
+         uint64_t hash = fnv_hash((const uint8_t*)data, size);
+         char hash_str[17];
+@@ -1452,6 +2011,43 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
+             return false;
+         }
+     }
++    // 親が送った「使われる数」でノードの探し表を埋める（全部のノードに印があるときだけ）
++    {
++        bool have_counts = true;
++        std::vector<int32_t> uses(n_nodes, 0);
++        for (uint32_t i = 0; i < n_nodes && have_counts; i++) {
++            if (graph->nodes[i] == nullptr) {
++                continue;
++            }
++            uint64_t id;
++            memcpy(&id, &nodes[i], sizeof(id));
++            auto it = tensor_ptrs.find(id);
++            uint32_t v = 0;
++            if (it != tensor_ptrs.end()) {
++                memcpy(&v, it->second->padding, sizeof(v));
++            }
++            if ((v & RPC_USE_COUNT_MARK) == 0) {
++                have_counts = false;
++                break;
++            }
++            uses[i] = (int32_t) (v & ~RPC_USE_COUNT_MARK);
++        }
++        if (have_counts) {
++            for (uint32_t i = 0; i < n_nodes; i++) {
++                ggml_tensor * node = graph->nodes[i];
++                if (node == nullptr) {
++                    continue;
++                }
++                const size_t pos = ggml_hash_find(&graph->visited_hash_set, node);
++                if (pos == GGML_HASHSET_FULL) {
++                    break;
++                }
++                graph->visited_hash_set.keys[pos] = node;
++                ggml_bitset_set(graph->visited_hash_set.used, pos);
++                graph->use_counts[pos] = uses[i];
++            }
++        }
++    }
+     ggml_status status = ggml_backend_graph_compute(backends[device], graph);
+     GGML_ASSERT(status == GGML_STATUS_SUCCESS && "Unsuccessful graph computations are not supported with RPC");
+     stored_graphs[device].graph = graph;
+@@ -1493,8 +2089,35 @@ rpc_server::~rpc_server() {
+     }
+ }
+ 
++// 子の側の認証: AUTH_CHALLENGE に乱数を返し、AUTH の HMAC を確かめて、自分の HMAC を返す。どこかで外れたら false（接続を切る）。
++static bool rpc_server_auth(socket_ptr sock, const std::string & key) {
++    uint8_t cmd;
++    if (!sock->recv_data(&cmd, 1) || cmd != RPC_CMD_AUTH_CHALLENGE || !recv_msg(sock, nullptr, 0)) {
++        return false;
++    }
++    rpc_msg_auth_challenge_rsp challenge = {};
++    rpc_random_bytes(challenge.nonce, sizeof(challenge.nonce));
++    if (!send_msg(sock, &challenge, sizeof(challenge))) {
++        return false;
++    }
++    rpc_msg_auth_req auth = {};
++    if (!sock->recv_data(&cmd, 1) || cmd != RPC_CMD_AUTH || !recv_msg(sock, &auth, sizeof(auth))) {
++        return false;
++    }
++    uint8_t expect[32];
++    rpc_auth_mac(key, "bw-rpc-auth-client", challenge.nonce, auth.nonce, expect);
++    rpc_msg_auth_rsp rsp = {};
++    if (!rpc_mac_equal(expect, auth.mac)) {
++        send_msg(sock, &rsp, sizeof(rsp));
++        return false;
++    }
++    rsp.ok = 1;
++    rpc_auth_mac(key, "bw-rpc-auth-server", challenge.nonce, auth.nonce, rsp.mac);
++    return send_msg(sock, &rsp, sizeof(rsp));
++}
++
+ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
+-                             socket_ptr sock) {
++                             socket_ptr sock, const std::string & key) {
+     rpc_server server(backends, cache_dir);
+     uint8_t cmd;
+     if (!sock->recv_data(&cmd, 1)) {
+@@ -1532,6 +2155,13 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+ 
+     // Activate transport upgrade using client's caps
+     sock->update_caps(req.conn_caps);
++    if (!key.empty() && !rpc_server_auth(sock, key)) {
++        // ★鍵があるときは、認証を通らない相手の命令は 1 つも受け付けない
++        fprintf(stderr, "RPC: a client failed key authentication; closing the connection\n");
++        return;
++    }
++    static rpc_prof prof("server");
++    int64_t t_done = prof.on ? ggml_time_us() : 0;
+     while (true) {
+         if (!sock->recv_data(&cmd, 1)) {
+             break;
+@@ -1541,11 +2171,26 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+             GGML_LOG_ERROR("Unknown command: %d\n", cmd);
+             break;
+         }
++        const int64_t t_cmd = prof.on ? ggml_time_us() : 0;
++        if (prof.on) {
++            prof.add_idle(t_cmd - t_done);
++        }
++        uint64_t prof_in = 0, prof_out = 0;
+         switch (cmd) {
+             case RPC_CMD_HELLO: {
+                 // HELLO command is handled above
+                 return;
+             }
++            case RPC_CMD_AUTH_CHALLENGE: {
++                // 鍵の無い子: 長さ 0 で答える＝親は「子が鍵を持たない」と分かって繋がない。鍵のある子で 2 度目は切る
++                if (!key.empty() || !recv_msg(sock, nullptr, 0) || !send_msg(sock, nullptr, 0)) {
++                    return;
++                }
++                break;
++            }
++            case RPC_CMD_AUTH: {
++                return;
++            }
+             case RPC_CMD_DEVICE_COUNT: {
+                 if (!recv_msg(sock, nullptr, 0)) {
+                     return;
+@@ -1671,11 +2316,43 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+                 if (!recv_msg(sock, input)) {
+                     return;
+                 }
++                prof_in = input.size();
++                if (prof.on && input.size() >= sizeof(rpc_tensor)) {
++                    char name[GGML_MAX_NAME + 1] = {};
++                    memcpy(name, ((const rpc_tensor *) input.data())->name, GGML_MAX_NAME);
++                    prof.add_set_name(name, input.size() - sizeof(rpc_tensor) - sizeof(uint64_t));
++                }
+                 if (!server.set_tensor(input)) {
+                     return;
+                 }
+                 break;
+             }
++            case RPC_CMD_SET_TENSOR_STORE: {
++                std::vector<uint8_t> input;
++                if (!recv_msg(sock, input)) {
++                    return;
++                }
++                prof_in = input.size();
++                if (!server.set_tensor_store(input)) {
++                    return;
++                }
++                break;
++            }
++            case RPC_CMD_SET_TENSOR_SLOT: {
++                rpc_msg_set_tensor_slot_req request;
++                if (!recv_msg(sock, &request, sizeof(request))) {
++                    return;
++                }
++                if (prof.on) {
++                    char name[GGML_MAX_NAME + 1] = {};
++                    memcpy(name, request.tensor.name, GGML_MAX_NAME);
++                    prof.add_set_name((std::string("slot:") + name).c_str(), 0);
++                }
++                if (!server.set_tensor_slot(request)) {
++                    return;
++                }
++                break;
++            }
+             case RPC_CMD_SET_TENSOR_HASH: {
+                 rpc_msg_set_tensor_hash_req request;
+                 if (!recv_msg(sock, &request, sizeof(request))) {
+@@ -1712,6 +2389,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+                 if (!server.get_tensor(request, response)) {
+                     return;
+                 }
++                prof_out = response.size();
+                 if (!send_msg(sock, response.data(), response.size())) {
+                     return;
+                 }
+@@ -1736,6 +2414,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+                 if (!recv_msg(sock, input)) {
+                     return;
+                 }
++                prof_in = input.size();
+                 if (!server.graph_compute(input)) {
+                     return;
+                 }
+@@ -1770,6 +2449,10 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
+                 return;
+             }
+         }
++        if (prof.on) {
++            t_done = ggml_time_us();
++            prof.add(cmd, t_done - t_cmd, prof_out, prof_in);
++        }
+     }
+ }
+ 
+@@ -1784,8 +2467,39 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
+         RPC_PROTO_MAJOR_VERSION,
+         RPC_PROTO_MINOR_VERSION,
+         RPC_PROTO_PATCH_VERSION);
++    std::string key;
++    if (!rpc_load_key(key)) {
++        fprintf(stderr, "Failed to load the RPC key (GGML_RPC_KEY_FILE)\n");
++        return;
++    }
+     printf("  endpoint       : %s\n", endpoint);
+     printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
++    printf("  auth           : %s\n", key.empty() ? "none" : "shared key (HMAC-SHA256, traffic not encrypted)");
++    // ★受け付ける相手の住所（GGML_RPC_ALLOW=192.0.2.10,127.0.0.1）。空ならだれでも（鍵があれば鍵で絞る）
++    std::vector<std::string> allow;
++    if (const char * env = std::getenv("GGML_RPC_ALLOW")) {
++        std::string list = env;
++        size_t pos = 0;
++        while (pos <= list.size()) {
++            size_t end = list.find(',', pos);
++            if (end == std::string::npos) {
++                end = list.size();
++            }
++            std::string a = list.substr(pos, end - pos);
++            a.erase(std::remove_if(a.begin(), a.end(), [](char c) { return c == ' ' || c == '\t'; }), a.end());
++            if (!a.empty()) {
++                allow.push_back(a);
++            }
++            pos = end + 1;
++        }
++    }
++    {
++        std::string shown;
++        for (auto & a : allow) {
++            shown += (shown.empty() ? "" : ",") + a;
++        }
++        printf("  allow          : %s\n", allow.empty() ? "any" : shown.c_str());
++    }
+     printf("Devices:\n");
+     for (size_t i = 0; i < n_devices; i++) {
+         auto dev = devices[i];
+@@ -1834,10 +2548,17 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
+             fprintf(stderr, "Failed to accept client connection\n");
+             return;
+         }
+-        printf("Accepted client connection\n");
++        const std::string peer = client_socket->peer_addr();
++        if (!allow.empty() && std::find(allow.begin(), allow.end(), peer) == allow.end()) {
++            // ★受け付ける相手（GGML_RPC_ALLOW）に無い住所は、命令を 1 つも読まずに切る
++            printf("Rejected client connection from %s (not in GGML_RPC_ALLOW)\n", peer.c_str());
++            fflush(stdout);
++            continue;
++        }
++        printf("Accepted client connection from %s\n", peer.c_str());
+         fflush(stdout);
+-        rpc_serve_client(backends, cache_dir, client_socket);
+-        printf("Client connection closed\n");
++        rpc_serve_client(backends, cache_dir, client_socket, key);
++        printf("Client connection closed (%s)\n", peer.c_str());
+         fflush(stdout);
+     }
+     rpc_transport_shutdown();
+@@ -1871,19 +2592,46 @@ static enum ggml_backend_dev_type ggml_backend_rpc_device_get_type(ggml_backend_
+     GGML_UNUSED(dev);
+ }
+ 
++// ★流れ作業（pipeline parallelism）に入れるため、待たずに積める・待ち合わせの印がある、と名乗る。
++// 子は命令を届いた順に 1 つずつ片づけるので、計算（返事なし）は元から待たずに積めている。印に中身は要らない:
++//   - 印を待つ（event_synchronize / event_wait）の後に親がすることは、子への命令（入力を置く・計算させる）か、
++//     子からの読み出し（往復）だけ。命令は前の計算の後ろに並び、読み出しは前の命令が全部済んでから返る。
++//   - 親の手元のメモリは、入力を置く命令が送り終わった時点で使い終わっている（送る前に写している）。
++// GGML_RPC_NO_PIPELINE=1 で今までどおり名乗らない（llama.cpp は流れ作業を使わない）。
++static bool rpc_pipeline_enabled() {
++    const char * off = std::getenv("GGML_RPC_NO_PIPELINE");
++    return off == nullptr || *off == '\0' || strcmp(off, "0") == 0;
++}
++
+ static void ggml_backend_rpc_device_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_props * props) {
+     props->name        = ggml_backend_rpc_device_get_name(dev);
+     props->description = ggml_backend_rpc_device_get_description(dev);
+     props->type        = ggml_backend_rpc_device_get_type(dev);
+     ggml_backend_rpc_device_get_memory(dev, &props->memory_free, &props->memory_total);
++    const bool pipeline = rpc_pipeline_enabled();
+     props->caps = {
+-        /* .async                 = */ false,
++        /* .async                 = */ pipeline,
+         /* .host_buffer           = */ false,
+         /* .buffer_from_host_ptr  = */ false,
+-        /* .events                = */ false,
++        /* .events                = */ pipeline,
+     };
+ }
+ 
++static ggml_backend_event_t ggml_backend_rpc_device_event_new(ggml_backend_dev_t dev) {
++    return new ggml_backend_event { /* .device = */ dev, /* .context = */ nullptr };
++}
++
++static void ggml_backend_rpc_device_event_free(ggml_backend_dev_t dev, ggml_backend_event_t event) {
++    GGML_UNUSED(dev);
++    delete event;
++}
++
++static void ggml_backend_rpc_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
++    // 子は届いた順に片づけるので待つものは無い（上の説明）
++    GGML_UNUSED(dev);
++    GGML_UNUSED(event);
++}
++
+ static ggml_backend_t ggml_backend_rpc_device_init(ggml_backend_dev_t dev, const char * params) {
+     ggml_backend_rpc_device_context * ctx = (ggml_backend_rpc_device_context *)dev->context;
+ 
+@@ -1929,9 +2677,9 @@ static const struct ggml_backend_device_i ggml_backend_rpc_device_i = {
+     /* .supports_op          = */ ggml_backend_rpc_device_supports_op,
+     /* .supports_buft        = */ ggml_backend_rpc_device_supports_buft,
+     /* .offload_op           = */ NULL,
+-    /* .event_new            = */ NULL,
+-    /* .event_free           = */ NULL,
+-    /* .event_synchronize    = */ NULL,
++    /* .event_new            = */ ggml_backend_rpc_device_event_new,
++    /* .event_free           = */ ggml_backend_rpc_device_event_free,
++    /* .event_synchronize    = */ ggml_backend_rpc_device_event_synchronize,
+ };
+ 
+ // backend reg interface
+diff --git a/ggml/src/ggml-rpc/transport.cpp b/ggml/src/ggml-rpc/transport.cpp
+index a728152..be8a88f 100644
+--- a/ggml/src/ggml-rpc/transport.cpp
++++ b/ggml/src/ggml-rpc/transport.cpp
+@@ -135,6 +135,7 @@ struct socket_t::impl {
+ #endif // GGML_RPC_RDMA
+     bool     use_rdma;
+     sockfd_t fd;
++    char     peer[64] = {};
+ };
+ 
+ socket_t::impl::~impl() {
+@@ -586,7 +587,9 @@ static bool set_reuse_addr(sockfd_t sockfd) {
+ }
+ 
+ socket_ptr socket_t::accept() {
+-    auto client_socket_fd = ::accept(pimpl->fd, NULL, NULL);
++    struct sockaddr_in addr = {};
++    socklen_t addr_len = sizeof(addr);
++    auto client_socket_fd = ::accept(pimpl->fd, (struct sockaddr *) &addr, &addr_len);
+     if (!is_valid_fd(client_socket_fd)) {
+         return nullptr;
+     }
+@@ -594,7 +597,15 @@ socket_ptr socket_t::accept() {
+         GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
+         return nullptr;
+     }
+-    return socket_ptr(new socket_t(std::make_unique<impl>(client_socket_fd)));
++    auto p = std::make_unique<impl>(client_socket_fd);
++    if (addr.sin_family == AF_INET) {
++        inet_ntop(AF_INET, &addr.sin_addr, p->peer, sizeof(p->peer));
++    }
++    return socket_ptr(new socket_t(std::move(p)));
++}
++
++const char * socket_t::peer_addr() const {
++    return pimpl->peer;
+ }
+ 
+ socket_ptr socket_t::create_server(const char * host, int port) {
+diff --git a/ggml/src/ggml-rpc/transport.h b/ggml/src/ggml-rpc/transport.h
+index 73b85cc..efebbb5 100644
+--- a/ggml/src/ggml-rpc/transport.h
++++ b/ggml/src/ggml-rpc/transport.h
+@@ -17,6 +17,8 @@ struct socket_t {
+     bool recv_data(void * data, size_t size);
+ 
+     socket_ptr accept();
++    // ★相手の住所（accept で受けた側だけ・IPv4 の文字列）。分からなければ空
++    const char * peer_addr() const;
+ 
+     void get_caps(uint8_t * local_caps);
+     void update_caps(const uint8_t * remote_caps);
+diff --git a/tools/rpc/rpc-server.cpp b/tools/rpc/rpc-server.cpp
+index 08e6803..738816c 100644
+--- a/tools/rpc/rpc-server.cpp
++++ b/tools/rpc/rpc-server.cpp
+@@ -175,6 +175,7 @@ struct rpc_server_params {
+     bool                     use_cache   = false;
+     int                      n_threads   = std::max(1U, std::thread::hardware_concurrency()/2);
+     std::vector<std::string> devices;
++    std::string              key_file;
+ };
+ 
+ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
+@@ -186,6 +187,7 @@ static void print_usage(int /*argc*/, char ** argv, rpc_server_params params) {
+     fprintf(stderr, "  -H, --host HOST                  host to bind to (default: %s)\n", params.host.c_str());
+     fprintf(stderr, "  -p, --port PORT                  port to bind to (default: %d)\n", params.port);
+     fprintf(stderr, "  -c, --cache                      enable local file cache\n");
++    fprintf(stderr, "  -k, --key-file PATH              require clients to prove they hold the same key (GGML_RPC_KEY_FILE)\n");
+     fprintf(stderr, "\n");
+ }
+ 
+@@ -233,6 +235,11 @@ static bool rpc_server_params_parse(int argc, char ** argv, rpc_server_params &
+             }
+         } else if (arg == "-c" || arg == "--cache") {
+             params.use_cache = true;
++        } else if (arg == "-k" || arg == "--key-file") {
++            if (++i >= argc) {
++                return false;
++            }
++            params.key_file = argv[i];
+         } else if (arg == "-h" || arg == "--help") {
+             print_usage(argc, argv, params);
+             exit(0);
+@@ -289,6 +296,8 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
+ 
+ int main(int argc, char * argv[]) {
+     std::setlocale(LC_NUMERIC, "C");
++    // ★systemd の下でも記録をすぐ出す（標準出力が管のときは溜めてしまう）
++    setvbuf(stdout, nullptr, _IOLBF, 0);
+ 
+     ggml_backend_load_all();
+ 
+@@ -298,7 +307,18 @@ int main(int argc, char * argv[]) {
+         return 1;
+     }
+ 
+-    if (params.host != "127.0.0.1") {
++    if (!params.key_file.empty()) {
++        // ★鍵はファイルの場所だけを環境変数で渡す（値を引数やログに出さない）
++#ifdef _WIN32
++        _putenv_s("GGML_RPC_KEY_FILE", params.key_file.c_str());
++#else
++        setenv("GGML_RPC_KEY_FILE", params.key_file.c_str(), 1);
++#endif
++    }
++    const char * key_env = std::getenv("GGML_RPC_KEY_FILE");
++    if (params.host != "127.0.0.1" && key_env != nullptr && *key_env != '\0') {
++        fprintf(stderr, "note: Host ('%s') is != '127.0.0.1'; clients must hold the key, but traffic is not encrypted\n", params.host.c_str());
++    } else if (params.host != "127.0.0.1") {
+         fprintf(stderr, "\n");
+         fprintf(stderr, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
+         fprintf(stderr, "WARNING: Host ('%s') is != '127.0.0.1'\n", params.host.c_str());

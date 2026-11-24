@@ -1,0 +1,23 @@
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 19cca7d..30f599f 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -13,6 +13,7 @@
+ #include "llama.h"
+ 
+ #include <cinttypes>
++#include <cstdlib>
+ #include <cmath>
+ #include <cstring>
+ #include <limits>
+@@ -426,7 +427,9 @@ llama_context::llama_context(
+             model.n_gpu_layers() > model.hparams.n_layer_all &&
+             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
+             cparams.offload_kqv &&
+-            !model.has_tensor_overrides();
++            // L.A.P.S patch 0002: allow it with tensor overrides when asked (e.g. experts on one GPU,
++            // attention on another). upstream disables it whenever overrides are used.
++            (!model.has_tensor_overrides() || getenv("LLAMA_PIPELINE_WITH_OVERRIDES") != nullptr);
+ 
+         // pipeline parallelism requires support for async compute and events in all devices
+         if (pipeline_parallel) {

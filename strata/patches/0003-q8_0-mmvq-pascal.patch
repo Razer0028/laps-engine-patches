@@ -1,0 +1,118 @@
+diff --git a/src/kernels/cuda/native_mmvq.cu b/src/kernels/cuda/native_mmvq.cu
+index 0f2bdf7dc..94ee89878 100644
+--- a/src/kernels/cuda/native_mmvq.cu
++++ b/src/kernels/cuda/native_mmvq.cu
+@@ -3471,9 +3471,113 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
+     return true;
+ }
+ 
++#if !defined(__HIPCC__)
++// STRATA_Q8_K2=1 (opt-in, lab): Q8_0 decode GEMV for 2..4 columns that reads the GGUF 34-byte blocks as they are (no packed
++// copy, no extra VRAM).  A pair of blocks is 68 bytes = 17 aligned words: block 0's int8 values are words shifted by 16 bits
++// (funnel shift), block 1's are whole words.  One warp = 4 rows x 8 pairs per chunk: its weights come in as 16-byte
++// coalesced loads into shared memory, then each lane reads its pair's 17 words (stride 17 = no bank conflict); the window's
++// activations are copied into shared memory once per workgroup.  The per-block products are summed in another order than
++// native_q8_0_mmvq's exact kernels (int8 dots exact; float rounding only, rel. error ~1.5e-7 of the largest output).
++namespace {
++template<int NCOLS>
++__launch_bounds__(128)
++__global__ void q8_k2_kernel(const int* __restrict__ w, const int* __restrict__ x, float* __restrict__ y, int n_in, int n_out) {
++    extern __shared__ int q8k2_smem[];
++    const int nb = n_in / 32, npair = nb / 2, xw = nb * 9, nch = npair / 8;
++    int* sw = q8k2_smem + (threadIdx.x / 32) * (4 * 136);
++    int* sxx = q8k2_smem + 4 * 4 * 136;
++    for (int i = int(threadIdx.x); i < NCOLS * xw; i += 128) sxx[i] = x[i];
++    __syncthreads();
++    const int lane = int(threadIdx.x) & 31, r = lane >> 3, p = lane & 7;
++    const int row0 = (int(blockIdx.x) * 4 + int(threadIdx.x) / 32) * 4;
++    const int row = row0 + r;
++    const std::size_t rowi4 = std::size_t(npair) * 17 / 4;
++    float acc[NCOLS];
++#pragma unroll
++    for (int j = 0; j < NCOLS; ++j) acc[j] = 0.0f;
++    for (int c = 0; c < nch; ++c) {
++        int4 t[5];
++#pragma unroll
++        for (int u = 0; u < 5; ++u) {
++            const int f = lane + u * 32;
++            if (f < 136) {
++                const int rr = f / 34, off = f % 34;
++                t[u] = row0 + rr < n_out ? __ldg(reinterpret_cast<const int4*>(w) + std::size_t(row0 + rr) * rowi4 + std::size_t(c) * 34 + off)
++                                         : make_int4(0, 0, 0, 0);
++            }
++        }
++        __syncwarp();
++#pragma unroll
++        for (int u = 0; u < 5; ++u) {
++            const int f = lane + u * 32;
++            if (f < 136) reinterpret_cast<int4*>(sw + (f / 34) * 136)[f % 34] = t[u];
++        }
++        __syncwarp();
++        const int* v = sw + r * 136 + p * 17;
++        const int pg = c * 8 + p;
++        const float d0 = __half2float(__ushort_as_half(static_cast<unsigned short>(v[0] & 0xffff)));
++        const float d1 = __half2float(__ushort_as_half(static_cast<unsigned short>(static_cast<unsigned>(v[8]) >> 16)));
++#pragma unroll
++        for (int j = 0; j < NCOLS; ++j) {
++            const int* xb = sxx + std::size_t(j) * xw + std::size_t(pg) * 18;
++            int s0 = 0, s1 = 0;
++#pragma unroll
++            for (int i = 0; i < 8; ++i) {
++                s0 = STRATA_DP4A(static_cast<int>(__funnelshift_r(static_cast<unsigned>(v[i]), static_cast<unsigned>(v[i + 1]), 16)), xb[1 + i], s0);
++                s1 = STRATA_DP4A(v[9 + i], xb[10 + i], s1);
++            }
++            acc[j] += d0 * __low2float(*reinterpret_cast<const half2*>(xb)) * float(s0);
++            acc[j] += d1 * __low2float(*reinterpret_cast<const half2*>(xb + 9)) * float(s1);
++        }
++        __syncwarp();
++    }
++#pragma unroll
++    for (int j = 0; j < NCOLS; ++j) {
++        float v = acc[j];
++#pragma unroll
++        for (int o = 4; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o, 8);
++        if (p == 0 && row < n_out) y[std::size_t(j) * n_out + row] = v;
++    }
++}
++
++bool q8_k2_on() {
++    static const bool on = [] { const char* v = std::getenv("STRATA_Q8_K2"); return v && v[0] == '1' && v[1] == '\0'; }();
++    return on;
++}
++
++template<int NCOLS>
++void q8_k2_launch(const void* w, const void* x, float* y, int n_in, int n_out, cudaStream_t s) {
++    const std::size_t smem = (std::size_t(4) * 4 * 136 + std::size_t(NCOLS) * (n_in / 32) * 9) * sizeof(int);
++    q8_k2_kernel<NCOLS><<<unsigned((n_out + 15) / 16), 128, smem, s>>>(static_cast<const int*>(w), static_cast<const int*>(x), y, n_in, n_out);
++}
++
++// true when it ran: 2..4 columns, n_in a multiple of 512 (whole 8-pair chunks), 16-byte aligned weights, shared memory <= 48 KiB
++bool q8_k2_mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
++    if (!q8_k2_on() || ncols < 2 || ncols > 4 || n_in % 512 != 0 || n_out < 64) return false;
++    if (reinterpret_cast<std::uintptr_t>(weights) % 16 != 0 || reinterpret_cast<std::uintptr_t>(x_q8_1) % 4 != 0) return false;
++    if ((std::size_t(4) * 4 * 136 + std::size_t(ncols) * (n_in / 32) * 9) * sizeof(int) > 48 * 1024) return false;
++    validate_pointer(weights);
++    validate_pointer(x_q8_1);
++    validate_pointer(y);
++    validate_stream(stream);
++    const auto s = static_cast<cudaStream_t>(stream);
++    switch (ncols) {
++        case 2: q8_k2_launch<2>(weights, x_q8_1, y, n_in, n_out, s); break;
++        case 3: q8_k2_launch<3>(weights, x_q8_1, y, n_in, n_out, s); break;
++        default: q8_k2_launch<4>(weights, x_q8_1, y, n_in, n_out, s); break;
++    }
++    launch_check();
++    return true;
++}
++} // namespace
++#else
++namespace { bool q8_k2_mmvq(const void*, const void*, float*, int, int, int, void*) { return false; } }
++#endif
++
+ void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
+                        int n_in, int n_out, int ncols, void* stream) {
+     if (q8_packed_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // STRATA_Q8_PACKED=1 tensors
++    if (q8_k2_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // STRATA_Q8_K2=1
+     small_mmvq<Q80Block, 8>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
+ }
+ 

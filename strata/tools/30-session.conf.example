@@ -1,0 +1,6 @@
+# 止める前に会話の状態を保存し、起動した後に戻す（strata-session.sh）。
+# Save the conversation state before the server stops and restore it after it starts.
+# Put this file in /etc/systemd/system/<your-strata-unit>.service.d/ and run `systemctl daemon-reload`.
+[Service]
+ExecStop=-/usr/local/bin/strata-session.sh save
+ExecStartPost=-/bin/sh -c "/usr/local/bin/strata-session.sh restore &"

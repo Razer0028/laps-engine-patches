@@ -1,0 +1,59 @@
+diff --git a/common/json-schema-to-grammar.cpp b/common/json-schema-to-grammar.cpp
+index b18607c..0cea0a8 100644
+--- a/common/json-schema-to-grammar.cpp
++++ b/common/json-schema-to-grammar.cpp
+@@ -686,43 +686,22 @@ private:
+         }
+ 
+         if (!optional_props.empty()) {
+-            rule += " (";
+-            if (!required_props.empty()) {
+-                rule += " \",\" space ( ";
+-            }
+-
+-            std::function<std::string(const std::vector<std::string> &, bool)> get_recursive_refs = [&](const std::vector<std::string> & ks, bool first_is_optional) {
+-                std::string res;
+-                if (ks.empty()) {
+-                    return res;
+-                }
+-                const std::string& k = ks[0];
+-                std::string kv_rule_name = prop_kv_rule_names[k];
+-                std::string comma_ref = "( \",\" space " + kv_rule_name + " )";
+-                if (first_is_optional) {
+-                    res = comma_ref + (k == "*" ? "*" : "?");
+-                } else {
+-                    res = kv_rule_name + (k == "*" ? " " + comma_ref + "*" : "");
+-                }
+-                if (ks.size() > 1) {
+-                    res += " " + _add_rule(
+-                        name + (name.empty() ? "" : "-") + k + "-rest",
+-                        get_recursive_refs(std::vector<std::string>(ks.begin() + 1, ks.end()), true)
+-                    );
+-                }
+-                return res;
+-            };
+-
++            // L.A.P.S 0006: 任意の引数を定義の順に縛らない（2026-10-31）。
++            // 上流は定義の順でしか書けず、飛ばすと戻れない。North は shelf を先に書くことがあり、その後 q を書けなくなって
++            // 検索語を別の欄に書いた（同じ問いで文法なしは 4/4 で q を書き、文法ありは 2/4 で q を失った）。
++            std::string any;
+             for (size_t i = 0; i < optional_props.size(); i++) {
+                 if (i > 0) {
+-                    rule += " | ";
++                    any += " | ";
+                 }
+-                rule += get_recursive_refs(std::vector<std::string>(optional_props.begin() + i, optional_props.end()), false);
++                any += prop_kv_rule_names[optional_props[i]];
+             }
+-            if (!required_props.empty()) {
+-                rule += " )";
++            std::string any_rule = optional_props.size() == 1 ? any : _add_rule(name + (name.empty() ? "" : "-") + "any-opt", any);
++            if (required_props.empty()) {
++                rule += " ( " + any_rule + " ( \",\" space " + any_rule + " )* )?";
++            } else {
++                rule += " ( \",\" space " + any_rule + " )*";
+             }
+-            rule += " )?";
+         }
+ 
+         rule += " space \"}\"";

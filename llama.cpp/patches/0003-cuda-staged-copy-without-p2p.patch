@@ -1,0 +1,104 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 561ab7a..207b99b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2434,6 +2434,88 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
+         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+ }
+ 
++// L.A.P.S patch 0003: copy between GPUs that cannot access each other (no P2P, e.g. different generations or
++// a VM) through pinned host memory, asynchronously on both streams. cudaMemcpyPeerAsync also works without P2P,
++// but the driver stages it in a way that stalls both devices, so a pipelined split never overlaps.
++// enabled with GGML_CUDA_STAGED_COPY=1.
++namespace {
++struct cuda_staged_slot {
++    void *      buf      = nullptr;
++    size_t      size     = 0;
++    cudaEvent_t d2h_done = nullptr; // on the source device: the data is in buf
++    cudaEvent_t h2d_done = nullptr; // on the destination device: buf may be reused
++    int         dev_h2d  = -1;      // device h2d_done was created on
++};
++struct cuda_staged_ring {
++    std::vector<cuda_staged_slot> slots = std::vector<cuda_staged_slot>(16);
++    size_t next = 0;
++};
++}
++
++static bool ggml_cuda_staged_copy_enabled() {
++    static const bool on = getenv("GGML_CUDA_STAGED_COPY") != nullptr;
++    return on;
++}
++
++static bool ggml_cuda_can_access_peer(int src_physical, int dst_physical) {
++    static std::mutex mtx;
++    static std::map<std::pair<int, int>, bool> cache;
++    std::lock_guard<std::mutex> lk(mtx);
++    auto key = std::make_pair(src_physical, dst_physical);
++    auto it = cache.find(key);
++    if (it != cache.end()) {
++        return it->second;
++    }
++    int can = 0;
++    CUDA_CHECK(cudaDeviceCanAccessPeer(&can, dst_physical, src_physical));
++    cache[key] = can != 0;
++    return can != 0;
++}
++
++static void ggml_cuda_staged_copy(ggml_backend_cuda_context * ctx_src, ggml_backend_cuda_context * ctx_dst,
++                                  void * dst_ptr, const void * src_ptr, size_t n) {
++    static std::mutex mtx;
++    static std::map<std::pair<ggml_backend_cuda_context *, int>, cuda_staged_ring> rings;
++    std::lock_guard<std::mutex> lk(mtx);
++
++    cuda_staged_ring & ring = rings[std::make_pair(ctx_src, ctx_dst->device)];
++    cuda_staged_slot & slot = ring.slots[ring.next];
++    ring.next = (ring.next + 1) % ring.slots.size();
++
++    // the slot is free once the destination has read it the last time
++    if (slot.h2d_done) {
++        ggml_cuda_set_device(ctx_src->device);
++        CUDA_CHECK(cudaStreamWaitEvent(ctx_src->stream(), slot.h2d_done, 0));
++    }
++    if (slot.size < n) {
++        if (slot.buf) {
++            CUDA_CHECK(cudaEventSynchronize(slot.h2d_done));
++            CUDA_CHECK(cudaFreeHost(slot.buf));
++        }
++        ggml_cuda_set_device(ctx_src->device);
++        CUDA_CHECK(cudaHostAlloc(&slot.buf, n, cudaHostAllocPortable));
++        slot.size = n;
++    }
++    if (!slot.d2h_done) {
++        ggml_cuda_set_device(ctx_src->device);
++        CUDA_CHECK(cudaEventCreateWithFlags(&slot.d2h_done, cudaEventDisableTiming));
++    }
++    if (!slot.h2d_done || slot.dev_h2d != ctx_dst->device) {
++        ggml_cuda_set_device(ctx_dst->device);
++        CUDA_CHECK(cudaEventCreateWithFlags(&slot.h2d_done, cudaEventDisableTiming));
++        slot.dev_h2d = ctx_dst->device;
++    }
++
++    ggml_cuda_set_device(ctx_src->device);
++    CUDA_CHECK(cudaMemcpyAsync(slot.buf, src_ptr, n, cudaMemcpyDeviceToHost, ctx_src->stream()));
++    CUDA_CHECK(cudaEventRecord(slot.d2h_done, ctx_src->stream()));
++
++    ggml_cuda_set_device(ctx_dst->device);
++    CUDA_CHECK(cudaStreamWaitEvent(ctx_dst->stream(), slot.d2h_done, 0));
++    CUDA_CHECK(cudaMemcpyAsync(dst_ptr, slot.buf, n, cudaMemcpyHostToDevice, ctx_dst->stream()));
++    CUDA_CHECK(cudaEventRecord(slot.h2d_done, ctx_dst->stream()));
++}
++
+ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+@@ -2468,6 +2550,10 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+         const int dst_physical = ggml_cuda_get_physical_device(cuda_ctx_dst->device);
+         if (src_physical == dst_physical) {
+             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
++        } else if (ggml_cuda_staged_copy_enabled() && !ggml_cuda_can_access_peer(src_physical, dst_physical)) {
++            // L.A.P.S patch 0003: staged through pinned host memory, ordered on both streams
++            ggml_cuda_staged_copy(cuda_ctx_src, cuda_ctx_dst, dst->data, src->data, ggml_nbytes(dst));
++            return true;
+         } else {
+ #ifdef GGML_CUDA_NO_PEER_COPY
+             return false;
