@@ -46,6 +46,11 @@ two GPUs (`--pipeline-windows 2` with the MTP stage moved: −22 %), the P100 pr
 (`--spec 6`: long-context generation 34 → 27 tok/s), raising the 2080 SUPER power limit 200 → 250 W (no change).
 What did help without new code: letting expert-cache swaps not block (`STRATA_ADAPT_NOWAIT=1`, `STRATA_ADAPT_LAG=2`,
 upstream defaults for P100 and RTX 30 but not for P40): 46.8 → 51.0 tok/s.
+Also without new code (2026-11-25): letting the CPU take part of prompt processing (`STRATA_PREFILL_CPU_SHARE=auto`,
+`STRATA_PREFILL_CPU_SHARE_MAX=4864`). Reading 100 / 300 / 1,000 / 2,000 new tokens after a cached 18.8k-token prefix took
+2.6 / 3.5 / 6.1 / 8.0 s before and 2.0 / 2.5 / 4.8 / 7.2 s after (−10 to −27 %, 5 runs each, median); 2,000 tokens after an
+86k-token context 9.0 → 8.0 s. A fresh 28.5k-token read and the generation speed did not change, and a 3-question answer
+check stayed correct. Keeping more of the KV cache in VRAM (`--kv-resident 65536` or `131072`) did not help.
 
 ---
 
@@ -90,6 +95,10 @@ Strata と llama.cpp への差分です。使ったときのまま公開して�
 - **Strata（v0.2.9・c62d5e3a1）**: 層を分けた構成でも会話の状態の保存と復元ができるようにする差分と、P40 向けに書き直した計算の核 2 つ
   （TQ2_0 の専門家の掛け算は出力がビット一致・Q8_0 の核は既定で切 `STRATA_Q8_K2=1` で入る）。生成は 51.5 → 53.5〜55.0 tok/s（+4〜7%）。
   最初の測定の +9.5% は上振れでした。v0.2.16 へ移した差分も置きましたが、v0.2.16 は P40 で読み込みが 35% 遅くなるので本番には入れていません。
+- **設定だけで効いた物（2026-11-25）**: 読み込みの一部を CPU にも分担させる `STRATA_PREFILL_CPU_SHARE=auto`・`STRATA_PREFILL_CPU_SHARE_MAX=4864`。
+  控えに当たる 1.88 万トークンの後に新しく 100／300／1,000／2,000 トークンを読む時間が 2.6／3.5／6.1／8.0 秒 → 2.0／2.5／4.8／7.2 秒
+  （−10〜−27%・各 5 回の中央値）。8.6 万トークンの後の 2,000 トークンは 9.0 → 8.0 秒。2.85 万をまとめて読む時と生成の速さは変わらず、
+  答えの確かめ 3 問も正しいまま。KV を VRAM に多く置く `--kv-resident 65536`／`131072` は効きませんでした。
 - **llama.cpp（f9e832c）**: 控えをディスクに残して起動し直しても続きから読める（4 万トークンで 50 秒 → 1.3 秒）・網の先の GPU（RPC）の改善と鍵・
   道具の任意の引数を順不同で書けるようにする文法の直し、など 6 本。
 - 数字はすべてこの 1 台の機械で測った物です。日付・条件・回数を表に書いています。
